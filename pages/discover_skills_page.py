@@ -27,7 +27,8 @@ from modules.ui_components import (
 
 class DiscoverSkillsPanel:
     def __init__(self, parent, config_mgr, skill_manager, remote_content_manager,
-                 marketplace_client, *, set_status, close_panel=None, on_skill_installed=None):
+                 marketplace_client, *, set_status, close_panel=None, on_skill_installed=None,
+                 on_open_repo_manage=None):
         self.config = config_mgr
         self.skill_manager = skill_manager
         self.remote_content = remote_content_manager
@@ -35,12 +36,13 @@ class DiscoverSkillsPanel:
         self.set_status = set_status
         self.close_panel = close_panel
         self.on_skill_installed = on_skill_installed
+        self.on_open_repo_manage = on_open_repo_manage
         self.frame = tk.Frame(parent, bg=COLORS['bg_main'])
 
         self._current_source = 'registry'  # 'registry' | 'marketplace'
-        self._current_view = 'skills'  # 'skills' | 'repo_manage'
         self._registry_payload = self.skill_manager.load_registry_cache()
         self._marketplace_payload = None
+        self._marketplace_error = None
         self._all_skills = []
         self._filtered_skills = []
         self._search_var = tk.StringVar(value='')
@@ -50,11 +52,8 @@ class DiscoverSkillsPanel:
         self._source_buttons = {}
         self._source_filter_combo = None
         self._toolbar_row2 = None
-        self._repo_manage_btn = None
-        self._content_area = None
         self._grid_area = None
         self._card_grid = None
-        self._repo_area = None
         self._count_label = None
         self._search_entry = None
 
@@ -64,16 +63,14 @@ class DiscoverSkillsPanel:
     # ------------------------------------------------------------------ UI 构建
     def _build(self):
         # 顶部栏
-        self._toolbar = tk.Frame(self.frame, bg=COLORS['bg_main'])
-        self._toolbar.pack(fill=tk.X, pady=(0, 10))
-        self._build_toolbar(self._toolbar)
+        toolbar = tk.Frame(self.frame, bg=COLORS['bg_main'])
+        toolbar.pack(fill=tk.X, pady=(0, 10))
+        self._build_toolbar(toolbar)
 
-        # 内容区容器
-        self._content_area = tk.Frame(self.frame, bg=COLORS['bg_main'])
-        self._content_area.pack(fill=tk.BOTH, expand=True)
+        # 内容区
+        self._grid_area = ScrollablePage(self.frame, bg=COLORS['bg_main'])
+        self._grid_area.pack(fill=tk.BOTH, expand=True)
 
-        # 技能网格页
-        self._grid_area = ScrollablePage(self._content_area, bg=COLORS['bg_main'])
         self._card_grid = SkillCardGrid(
             self._grid_area.inner,
             card_width=280,
@@ -82,9 +79,6 @@ class DiscoverSkillsPanel:
             bg=COLORS['bg_main'],
         )
         self._card_grid.pack(fill=tk.BOTH, expand=True)
-
-        # 仓库管理页（初始隐藏）
-        self._repo_area = tk.Frame(self._content_area, bg=COLORS['bg_main'])
 
     def _build_toolbar(self, parent):
         # 第一行：数据源切换 | 搜索框 | 刷新
@@ -187,16 +181,16 @@ class DiscoverSkillsPanel:
         bind_combobox_dropdown_mousewheel(status_combo)
         status_combo.bind('<<ComboboxSelected>>', lambda e: self._apply_filters())
 
-        # 仓库管理按钮（合并添加+查看）
-        self._repo_manage_btn = create_home_shell_button(
+        # 仓库管理按钮
+        repo_manage_shell, _ = create_home_shell_button(
             self._toolbar_row2,
             '仓库管理',
-            command=self._toggle_repo_manage,
+            command=self._open_repo_manage,
             style='secondary',
             padx=10,
             pady=4,
-        )[0]
-        self._repo_manage_btn.pack(side=tk.LEFT, padx=(20, 0))
+        )
+        repo_manage_shell.pack(side=tk.LEFT, padx=(20, 0))
 
         # 计数标签
         self._count_label = tk.Label(
@@ -209,189 +203,10 @@ class DiscoverSkillsPanel:
         )
         self._count_label.pack(side=tk.RIGHT)
 
-    # ------------------------------------------------------------------ 页面视图切换
-    def _show_skills_view(self):
-        self._current_view = 'skills'
-        self._repo_area.pack_forget()
-        self._grid_area.pack(fill=tk.BOTH, expand=True)
-        # 刷新按钮和搜索/筛选栏恢复可见
-        self._source_filter_combo.configure(state='disabled' if self._current_source == 'marketplace' else 'readonly')
-        self._status_filter_var.set('全部')
-        # 更新仓库管理按钮文字
-        for child in self._repo_manage_btn.winfo_children():
-            if isinstance(child, tk.Button):
-                child.configure(text='仓库管理')
-                break
-        self._apply_filters()
-
-    def _show_repo_manage_view(self):
-        self._current_view = 'repo_manage'
-        self._grid_area.pack_forget()
-        self._repo_area.pack(fill=tk.BOTH, expand=True)
-        # 渲染仓库管理内容
-        self._render_repo_manage()
-        # 更新仓库管理按钮文字
-        for child in self._repo_manage_btn.winfo_children():
-            if isinstance(child, tk.Button):
-                child.configure(text='返回技能')
-                break
-
-    def _toggle_repo_manage(self):
-        if self._current_view == 'repo_manage':
-            self._show_skills_view()
-        else:
-            self._show_repo_manage_view()
-
-    # ------------------------------------------------------------------ 仓库管理页面
-    def _render_repo_manage(self):
-        # 清空仓库管理区域
-        for child in self._repo_area.winfo_children():
-            child.destroy()
-
-        scroll = ScrollablePage(self._repo_area, bg=COLORS['bg_main'])
-        scroll.pack(fill=tk.BOTH, expand=True)
-        inner = scroll.inner
-
-        # 添加仓库卡片
-        add_card = CardFrame(inner, title='添加仓库', padding=16)
-        add_card.pack(fill=tk.X, pady=(0, 14))
-
-        # 仓库名称
-        name_frame = tk.Frame(add_card.inner, bg=COLORS['card_bg'])
-        name_frame.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(name_frame, text='仓库名称:', font=FONTS['body'], fg=COLORS['text_main'],
-                 bg=COLORS['card_bg']).pack(side=tk.LEFT)
-        name_var = tk.StringVar()
-        name_entry = tk.Entry(name_frame, textvariable=name_var, font=FONTS['body'],
-                              bg=COLORS['input_bg'], fg=COLORS['text_main'], relief=tk.FLAT,
-                              highlightthickness=1, highlightbackground=COLORS['input_border'],
-                              insertbackground=COLORS['text_main'])
-        name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=4)
-
-        # 索引 URL
-        url_frame = tk.Frame(add_card.inner, bg=COLORS['card_bg'])
-        url_frame.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(url_frame, text='索引 URL:', font=FONTS['body'], fg=COLORS['text_main'],
-                 bg=COLORS['card_bg']).pack(side=tk.LEFT)
-        url_var = tk.StringVar()
-        url_entry = tk.Entry(url_frame, textvariable=url_var, font=FONTS['body'],
-                             bg=COLORS['input_bg'], fg=COLORS['text_main'], relief=tk.FLAT,
-                             highlightthickness=1, highlightbackground=COLORS['input_border'],
-                             insertbackground=COLORS['text_main'])
-        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=4)
-
-        # 添加按钮行
-        add_btn_row = tk.Frame(add_card.inner, bg=COLORS['card_bg'])
-        add_btn_row.pack(fill=tk.X, pady=(4, 0))
-
-        def do_add():
-            name = str(name_var.get() or '').strip()
-            url = str(url_var.get() or '').strip()
-            if not url:
-                messagebox.showwarning('添加仓库', '请输入索引 URL。', parent=self.frame.winfo_toplevel())
-                return
-            if not name:
-                name = url.split('/')[-1] or '自定义仓库'
-            self.set_status('正在验证仓库...', COLORS['warning'])
-
-            def on_validated(data):
-                try:
-                    self.skill_manager.sanitize_registry_payload(data)
-                    self.config.add_skills_repository({
-                        'id': '',
-                        'name': name,
-                        'url': url,
-                        'type': 'generic_json',
-                        'added_at': int(_time.time()),
-                        'enabled': True,
-                    })
-                    self.set_status('仓库添加成功', COLORS['success'])
-                    self._render_repo_manage()
-                    self._refresh()
-                except Exception as exc:
-                    messagebox.showerror('添加仓库', f'索引格式不兼容: {exc}', parent=self.frame.winfo_toplevel())
-
-            def on_validate_error(exc):
-                messagebox.showerror('添加仓库', f'无法访问该 URL: {exc}', parent=self.frame.winfo_toplevel())
-
-            self.remote_content.fetch_custom(url, on_success=on_validated, on_error=on_validate_error, force=True)
-
-        ModernButton(add_btn_row, '添加仓库', style='primary', padx=14, pady=5, command=do_add).pack(side=tk.LEFT)
-
-        # 已添加仓库列表卡片
-        repos = self.config.get_skills_repositories()
-        list_card = CardFrame(inner, title=f'已添加仓库 ({len(repos)})', padding=16)
-        list_card.pack(fill=tk.BOTH, expand=True, pady=(0, 14))
-
-        if not repos:
-            tk.Label(list_card.inner, text='暂无已添加的仓库。', font=FONTS['body'], fg=COLORS['text_sub'],
-                     bg=COLORS['card_bg'], anchor='w').pack(fill=tk.X)
-        else:
-            for repo in repos:
-                self._render_repo_item(list_card.inner, repo)
-
-        # 刷新布局
-        try:
-            self.frame.after_idle(lambda: scroll._apply_layout_refresh())
-        except tk.TclError:
-            pass
-
-    def _render_repo_item(self, parent, repo):
-        repo_id = repo.get('id', '')
-        is_official = repo_id == 'official'
-        enabled = repo.get('enabled', True)
-
-        item_frame = tk.Frame(parent, bg=COLORS['surface_alt'], highlightbackground=COLORS['divider'],
-                              highlightthickness=1, bd=0)
-        item_frame.pack(fill=tk.X, pady=(0, 8))
-
-        header = tk.Frame(item_frame, bg=COLORS['surface_alt'])
-        header.pack(fill=tk.X, padx=14, pady=(10, 0))
-
-        name_text = repo.get('name', repo_id)
-        if is_official:
-            name_text += '  (官方)'
-        tk.Label(header, text=name_text, font=FONTS['body_bold'], fg=COLORS['text_main'],
-                 bg=COLORS['surface_alt'], anchor='w').pack(side=tk.LEFT)
-
-        # 启用/禁用切换
-        enabled_var = tk.BooleanVar(value=enabled)
-
-        def on_toggle(rid=repo_id, var=enabled_var):
-            self.config.update_skills_repository(rid, {'enabled': var.get()})
-
-        tk.Checkbutton(
-            header,
-            text='启用',
-            variable=enabled_var,
-            command=on_toggle,
-            font=FONTS['small'],
-            fg=COLORS['text_main'],
-            bg=COLORS['surface_alt'],
-            activebackground=COLORS['surface_alt'],
-            activeforeground=COLORS['text_main'],
-            selectcolor=COLORS['surface_alt'],
-        ).pack(side=tk.RIGHT)
-
-        # URL
-        url_text = repo.get('url', '')
-        tk.Label(item_frame, text=url_text, font=FONTS['small'], fg=COLORS['text_sub'],
-                 bg=COLORS['surface_alt'], anchor='w').pack(fill=tk.X, padx=14, pady=(4, 6))
-
-        # 删除按钮（官方仓库不可删除）
-        if not is_official:
-            del_row = tk.Frame(item_frame, bg=COLORS['surface_alt'])
-            del_row.pack(fill=tk.X, padx=14, pady=(0, 10))
-
-            def do_delete(rid=repo_id, rname=repo.get('name', repo_id)):
-                if not messagebox.askyesno('删除仓库', f'确定删除仓库「{rname}」吗？',
-                                           parent=self.frame.winfo_toplevel()):
-                    return
-                self.config.remove_skills_repository(rid)
-                self._render_repo_manage()
-                self._refresh()
-
-            ModernButton(del_row, '删除', style='danger', padx=10, pady=3, command=do_delete).pack(side=tk.RIGHT)
+    # ------------------------------------------------------------------ 仓库管理（关闭当前弹窗，打开仓库管理弹窗）
+    def _open_repo_manage(self):
+        if callable(self.on_open_repo_manage):
+            self.on_open_repo_manage()
 
     # ------------------------------------------------------------------ 搜索占位符
     _SEARCH_PLACEHOLDER = '搜索技能名称/描述...'
@@ -429,7 +244,7 @@ class DiscoverSkillsPanel:
             return
         self._current_source = source_key
         for key, btn in self._source_buttons.items():
-            btn.configure(style='primary' if key == source_key else 'ghost')
+            btn.set_style('primary' if key == source_key else 'ghost')
         # 来源筛选仅在仓库模式下启用
         if source_key == 'marketplace':
             self._source_filter_combo.configure(state='disabled')
@@ -441,9 +256,6 @@ class DiscoverSkillsPanel:
         self._search_entry.insert(0, self._SEARCH_PLACEHOLDER)
         self._search_entry.configure(fg=COLORS['text_muted'])
         self._status_filter_var.set('全部')
-        # 如果在仓库管理页面则切回技能页
-        if self._current_view == 'repo_manage':
-            self._show_skills_view()
         self._load_source_data(source_key)
 
     # ------------------------------------------------------------------ 数据加载
@@ -571,11 +383,13 @@ class DiscoverSkillsPanel:
             self.set_status(f'skill.sh 已加载，共 {len(self._all_skills)} 个技能', COLORS['success'])
 
         def on_error(exc):
-            self.set_status(f'skill.sh 加载失败: {exc}', COLORS['warning'])
             self._all_skills = []
+            self._marketplace_error = str(exc)
             self._apply_filters()
+            self.set_status(f'skill.sh 加载失败: {exc}', COLORS['warning'])
 
-        self.marketplace.fetch_index(on_success=on_loaded, on_error=on_error, force=False)
+        self._marketplace_error = None
+        self.marketplace.fetch_index(on_success=on_loaded, on_error=on_error, force=True)
 
     def _merge_marketplace_to_skills(self, payload):
         installed = self.skill_manager.list_installed_skills(self._registry_payload)
@@ -605,8 +419,6 @@ class DiscoverSkillsPanel:
 
     # ------------------------------------------------------------------ 筛选
     def _apply_filters(self):
-        if self._current_view != 'skills':
-            return
         query = ''
         if not self._is_placeholder_active():
             query = str(self._search_var.get() or '').strip().lower()
@@ -656,13 +468,23 @@ class DiscoverSkillsPanel:
         self._card_grid.clear_cards()
 
         if not self._filtered_skills:
+            # 区分不同空状态
+            if self._current_source == 'marketplace' and getattr(self, '_marketplace_error', None):
+                empty_text = f'skill.sh 暂时不可用\n{self._marketplace_error}'
+            elif not self._all_skills and self._current_source == 'registry':
+                empty_text = '仓库中没有技能，请添加仓库或检查网络连接。'
+            elif self._all_skills and not self._filtered_skills:
+                empty_text = '没有找到匹配的技能。'
+            else:
+                empty_text = '暂无技能。'
             tk.Label(
                 self._card_grid,
-                text='没有找到匹配的技能。',
+                text=empty_text,
                 font=FONTS['body'],
                 fg=COLORS['text_sub'],
                 bg=COLORS['bg_main'],
                 anchor='center',
+                justify='center',
             ).grid(row=0, column=0, sticky='ew')
             self._card_grid.grid_columnconfigure(0, weight=1)
             return
@@ -1008,3 +830,184 @@ class DiscoverSkillsPanel:
             self.set_status(str(error), COLORS['error'])
         else:
             self.set_status('技能操作失败', COLORS['error'])
+
+
+# ======================================================================
+# 仓库管理弹窗面板（独立于发现技能弹窗，关闭后自动重新打开发现技能弹窗）
+# ======================================================================
+
+class RepoManagePanel:
+    def __init__(self, parent, config_mgr, skill_manager, remote_content_manager, *, set_status, close_panel=None):
+        self.config = config_mgr
+        self.skill_manager = skill_manager
+        self.remote_content = remote_content_manager
+        self.set_status = set_status
+        self.close_panel = close_panel
+        self.frame = tk.Frame(parent, bg=COLORS['bg_main'])
+
+        self._build()
+
+    def _build(self):
+        scroll = ScrollablePage(self.frame, bg=COLORS['bg_main'])
+        scroll.pack(fill=tk.BOTH, expand=True)
+        inner = scroll.inner
+        self._scroll = scroll
+
+        # 添加仓库卡片
+        add_card = CardFrame(inner, title='添加仓库', padding=16)
+        add_card.pack(fill=tk.X, pady=(0, 14))
+
+        name_frame = tk.Frame(add_card.inner, bg=COLORS['card_bg'])
+        name_frame.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(name_frame, text='仓库名称:', font=FONTS['body'], fg=COLORS['text_main'],
+                 bg=COLORS['card_bg']).pack(side=tk.LEFT)
+        name_var = tk.StringVar()
+        name_entry = tk.Entry(name_frame, textvariable=name_var, font=FONTS['body'],
+                              bg=COLORS['input_bg'], fg=COLORS['text_main'], relief=tk.FLAT,
+                              highlightthickness=1, highlightbackground=COLORS['input_border'],
+                              insertbackground=COLORS['text_main'])
+        name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=4)
+
+        url_frame = tk.Frame(add_card.inner, bg=COLORS['card_bg'])
+        url_frame.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(url_frame, text='索引 URL:', font=FONTS['body'], fg=COLORS['text_main'],
+                 bg=COLORS['card_bg']).pack(side=tk.LEFT)
+        url_var = tk.StringVar()
+        url_entry = tk.Entry(url_frame, textvariable=url_var, font=FONTS['body'],
+                             bg=COLORS['input_bg'], fg=COLORS['text_main'], relief=tk.FLAT,
+                             highlightthickness=1, highlightbackground=COLORS['input_border'],
+                             insertbackground=COLORS['text_main'])
+        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0), ipady=4)
+
+        add_btn_row = tk.Frame(add_card.inner, bg=COLORS['card_bg'])
+        add_btn_row.pack(fill=tk.X, pady=(4, 0))
+
+        def do_add():
+            name = str(name_var.get() or '').strip()
+            url = str(url_var.get() or '').strip()
+            if not url:
+                messagebox.showwarning('添加仓库', '请输入索引 URL。', parent=self.frame.winfo_toplevel())
+                return
+            if not name:
+                name = url.split('/')[-1] or '自定义仓库'
+            self.set_status('正在验证仓库...', COLORS['warning'])
+
+            def on_validated(data):
+                try:
+                    self.skill_manager.sanitize_registry_payload(data)
+                    self.config.add_skills_repository({
+                        'id': '',
+                        'name': name,
+                        'url': url,
+                        'type': 'generic_json',
+                        'added_at': int(_time.time()),
+                        'enabled': True,
+                    })
+                    self.set_status('仓库添加成功', COLORS['success'])
+                    self._refresh_repo_list()
+                except Exception as exc:
+                    messagebox.showerror('添加仓库', f'索引格式不兼容: {exc}', parent=self.frame.winfo_toplevel())
+
+            def on_validate_error(exc):
+                messagebox.showerror('添加仓库', f'无法访问该 URL: {exc}', parent=self.frame.winfo_toplevel())
+
+            self.remote_content.fetch_custom(url, on_success=on_validated, on_error=on_validate_error, force=True)
+
+        ModernButton(add_btn_row, '添加仓库', style='primary', padx=14, pady=5, command=do_add).pack(side=tk.LEFT)
+
+        # 已添加仓库列表卡片
+        self._list_card_placeholder = tk.Frame(inner, bg=COLORS['bg_main'])
+        self._list_card_placeholder.pack(fill=tk.BOTH, expand=True)
+        self._refresh_repo_list()
+
+        # 确保首次布局刷新（延迟稍长，等窗口完成渲染）
+        def _force_refresh():
+            try:
+                self.frame.update_idletasks()
+                self._scroll._apply_layout_refresh()
+            except tk.TclError:
+                pass
+        try:
+            self.frame.after(50, _force_refresh)
+        except tk.TclError:
+            pass
+
+    def _refresh_repo_list(self):
+        for child in self._list_card_placeholder.winfo_children():
+            child.destroy()
+
+        repos = self.config.get_skills_repositories()
+        list_card = CardFrame(self._list_card_placeholder, title=f'已添加仓库 ({len(repos)})', padding=16)
+        list_card.pack(fill=tk.BOTH, expand=True)
+
+        if not repos:
+            tk.Label(list_card.inner, text='暂无已添加的仓库。', font=FONTS['body'], fg=COLORS['text_sub'],
+                     bg=COLORS['card_bg'], anchor='w').pack(fill=tk.X)
+        else:
+            for repo in repos:
+                self._render_repo_item(list_card.inner, repo)
+
+        # 刷新滚动区域布局
+        def _force_refresh():
+            try:
+                self.frame.update_idletasks()
+                self._scroll._apply_layout_refresh()
+            except tk.TclError:
+                pass
+        try:
+            self.frame.after(50, _force_refresh)
+        except tk.TclError:
+            pass
+
+    def _render_repo_item(self, parent, repo):
+        repo_id = repo.get('id', '')
+        is_official = repo_id == 'official'
+        enabled = repo.get('enabled', True)
+
+        item_frame = tk.Frame(parent, bg=COLORS['surface_alt'], highlightbackground=COLORS['divider'],
+                              highlightthickness=1, bd=0)
+        item_frame.pack(fill=tk.X, pady=(0, 8))
+
+        header = tk.Frame(item_frame, bg=COLORS['surface_alt'])
+        header.pack(fill=tk.X, padx=14, pady=(10, 0))
+
+        name_text = repo.get('name', repo_id)
+        if is_official:
+            name_text += '  (官方)'
+        tk.Label(header, text=name_text, font=FONTS['body_bold'], fg=COLORS['text_main'],
+                 bg=COLORS['surface_alt'], anchor='w').pack(side=tk.LEFT)
+
+        enabled_var = tk.BooleanVar(value=enabled)
+
+        def on_toggle(rid=repo_id, var=enabled_var):
+            self.config.update_skills_repository(rid, {'enabled': var.get()})
+
+        tk.Checkbutton(
+            header,
+            text='启用',
+            variable=enabled_var,
+            command=on_toggle,
+            font=FONTS['small'],
+            fg=COLORS['text_main'],
+            bg=COLORS['surface_alt'],
+            activebackground=COLORS['surface_alt'],
+            activeforeground=COLORS['text_main'],
+            selectcolor=COLORS['surface_alt'],
+        ).pack(side=tk.RIGHT)
+
+        url_text = repo.get('url', '')
+        tk.Label(item_frame, text=url_text, font=FONTS['small'], fg=COLORS['text_sub'],
+                 bg=COLORS['surface_alt'], anchor='w').pack(fill=tk.X, padx=14, pady=(4, 6))
+
+        if not is_official:
+            del_row = tk.Frame(item_frame, bg=COLORS['surface_alt'])
+            del_row.pack(fill=tk.X, padx=14, pady=(0, 10))
+
+            def do_delete(rid=repo_id, rname=repo.get('name', repo_id)):
+                if not messagebox.askyesno('删除仓库', f'确定删除仓库「{rname}」吗？',
+                                           parent=self.frame.winfo_toplevel()):
+                    return
+                self.config.remove_skills_repository(rid)
+                self._refresh_repo_list()
+
+            ModernButton(del_row, '删除', style='danger', padx=10, pady=3, command=do_delete).pack(side=tk.RIGHT)

@@ -415,6 +415,7 @@ class SmartPaperTool:
         self._skills_center_panel = None
         self._discover_skills_window = None
         self._discover_skills_panel = None
+        self._repo_manage_window = None
         self._remote_content = None
         self.skill_manager = None
         self._version_check_anim_job = None
@@ -2941,6 +2942,7 @@ class SmartPaperTool:
             show_prompt_manager=self._show_prompt_manager,
             show_skills_center=self._show_skills_center,
             show_discover_skills=self._show_discover_skills,
+            show_repo_manage=self._show_repo_manage,
             show_model_routing=self._show_model_routing,
             switch_api_provider_direct=self._switch_api_provider_in_dialog,
             add_new_provider=self._add_new_provider_in_dialog,
@@ -3275,6 +3277,8 @@ class SmartPaperTool:
         if window is self._discover_skills_window:
             self._discover_skills_window = None
             self._discover_skills_panel = None
+        if window is self._repo_manage_window:
+            self._repo_manage_window = None
         window.destroy()
 
     def _get_active_model_label(self):
@@ -4201,6 +4205,7 @@ class SmartPaperTool:
             set_status=self._set_status,
             close_panel=lambda win=window: self._close_discover_dialog(win),
             on_skill_installed=on_installed,
+            on_open_repo_manage=self._show_repo_manage,
         )
         panel.frame.pack(fill=tk.BOTH, expand=True, padx=28, pady=28)
         self._discover_skills_panel = panel
@@ -4210,6 +4215,37 @@ class SmartPaperTool:
         self._discover_skills_window = None
         self._discover_skills_panel = None
         self._close_dialog(window)
+
+    def _show_repo_manage(self):
+        """关闭发现技能弹窗，打开仓库管理弹窗；关闭仓库管理弹窗后自动重新打开发现技能弹窗。"""
+        from pages.discover_skills_page import RepoManagePanel
+        # 先关闭发现技能弹窗
+        if self._discover_skills_window and self._discover_skills_window.winfo_exists():
+            self._close_discover_dialog(self._discover_skills_window)
+
+        window, body = self._create_dialog_shell('仓库管理', '800x700')
+        window.resizable(True, True)
+        apply_adaptive_window_geometry(window, '800x700', min_width=640, min_height=520)
+        # 覆盖关闭协议：点 X 也走回到发现技能弹窗的逻辑
+        window.protocol('WM_DELETE_WINDOW', lambda win=window: self._close_repo_manage_and_reopen_discover(win))
+
+        # 仓库管理面板
+        repo_panel = RepoManagePanel(
+            body,
+            self.config_mgr,
+            self.skill_manager,
+            self._remote_content,
+            set_status=self._set_status,
+            close_panel=lambda win=window: self._close_repo_manage_and_reopen_discover(win),
+        )
+        repo_panel.frame.pack(fill=tk.BOTH, expand=True, padx=28, pady=28)
+        self._repo_manage_window = window
+
+    def _close_repo_manage_and_reopen_discover(self, window):
+        self._repo_manage_window = None
+        self._close_dialog(window)
+        # 重新打开发现技能弹窗
+        self.root.after(100, self._show_discover_skills)
 
     def _collect_runtime_backup_zip_bytes(self):
         app_dir = os.path.abspath(self.config_mgr.app_dir)
