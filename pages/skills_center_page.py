@@ -679,22 +679,28 @@ class SkillsCenterPanel:
             child.destroy()
         self.scene_vars = {}
         selected_set = set(selected or [])
-        if not scene_bindings:
+        # 默认勾选：scene_bindings 中声明的场景（推荐绑定）
+        default_set = set(scene_bindings or [])
+        if not selected:
+            selected_set = default_set
+        # 展示所有可用场景（来自 SCENE_DEFS）
+        all_scene_ids = list(SCENE_DEFS.keys())
+        if not all_scene_ids:
             tk.Label(
                 self.scene_checks_frame,
-                text='当前技能没有可绑定的场景。',
+                text='当前没有可绑定的场景。',
                 font=FONTS['small'],
                 fg=COLORS['text_sub'],
                 bg=COLORS['card_bg'],
                 anchor='w',
             ).pack(fill=tk.X)
             return
-        for scene_id in scene_bindings:
+        for scene_id in all_scene_ids:
             scene_def = SCENE_DEFS.get(scene_id, {})
             page_label = scene_def.get('page_label', '')
             scene_label = scene_def.get('label', '')
             if page_label and scene_label:
-                display_name = f'{page_label} - {scene_label}'
+                display_name = f'{page_label} · {scene_label}'
             elif scene_label:
                 display_name = scene_label
             elif page_label:
@@ -703,7 +709,7 @@ class SkillsCenterPanel:
                 display_name = scene_id
             var = tk.BooleanVar(value=scene_id in selected_set)
             self.scene_vars[scene_id] = var
-            tk.Checkbutton(
+            cb = tk.Checkbutton(
                 self.scene_checks_frame,
                 text=display_name,
                 variable=var,
@@ -714,7 +720,11 @@ class SkillsCenterPanel:
                 activeforeground=COLORS['text_main'],
                 selectcolor=COLORS['card_bg'],
                 anchor='w',
-            ).pack(anchor='w')
+            )
+            cb.pack(anchor='w')
+            # 标记推荐绑定（manifest 声明的场景）
+            if scene_id in default_set and scene_id not in selected_set:
+                cb.select()
 
     def _render_action_tabs(self, actions):
         for child in self.action_tabs_bar.winfo_children():

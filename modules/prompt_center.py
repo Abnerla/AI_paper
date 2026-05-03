@@ -40,7 +40,7 @@ SCENE_DEFS = {
     'paper_write.outline': {
         'page_id': 'paper_write',
         'page_label': '论文写作',
-        'label': '大纲生成',
+        'label': '生成大纲',
         'variables': (
             ('topic', '论文标题'),
             ('style', '论文类型'),
@@ -52,7 +52,7 @@ SCENE_DEFS = {
     'paper_write.section': {
         'page_id': 'paper_write',
         'page_label': '论文写作',
-        'label': '章节写作',
+        'label': '撰写章节',
         'variables': (
             ('outline', '完整大纲'),
             ('section_title', '当前章节'),
@@ -65,40 +65,17 @@ SCENE_DEFS = {
     'paper_write.abstract': {
         'page_id': 'paper_write',
         'page_label': '论文写作',
-        'label': '摘要生成',
+        'label': '生成摘要',
         'variables': (
             ('full_text', '论文全文'),
             ('language', '摘要语言'),
         ),
         'required_variables': ('full_text',),
     },
-    'ai_reduce.transform': {
-        'page_id': 'ai_reduce',
-        'page_label': '降AI检测',
-        'label': '开始执行',
-        'variables': (
-            ('text', '待处理原文'),
-            ('mode', '模式值'),
-            ('mode_label', '处理模式'),
-        ),
-        'required_variables': ('text', 'mode_label'),
-    },
-    'plagiarism.transform': {
-        'page_id': 'plagiarism',
-        'page_label': '降查重率',
-        'label': '开始执行',
-        'variables': (
-            ('text', '待降重原文'),
-            ('source_text', '查重报告/重复源'),
-            ('mode', '模式值'),
-            ('mode_label', '处理模式'),
-        ),
-        'required_variables': ('text', 'mode_label'),
-    },
     'polish.run_task': {
         'page_id': 'polish',
         'page_label': '学术润色',
-        'label': '执行AI任务',
+        'label': '统一任务',
         'variables': (
             ('text', '待处理文本'),
             ('task_type', '任务类型'),
@@ -109,10 +86,43 @@ SCENE_DEFS = {
         ),
         'required_variables': ('text', 'task_type', 'polish_type', 'execution_mode'),
     },
+    'polish.translate': {
+        'page_id': 'polish',
+        'page_label': '学术润色',
+        'label': '翻译润色',
+        'variables': (
+            ('text', '待翻译文本'),
+            ('target_lang', '目标语言'),
+        ),
+        'required_variables': ('text', 'target_lang'),
+    },
+    'ai_reduce.transform': {
+        'page_id': 'ai_reduce',
+        'page_label': '降AI检测',
+        'label': '文本改写',
+        'variables': (
+            ('text', '待处理原文'),
+            ('mode', '模式值'),
+            ('mode_label', '处理模式'),
+        ),
+        'required_variables': ('text', 'mode_label'),
+    },
+    'plagiarism.transform': {
+        'page_id': 'plagiarism',
+        'page_label': '降查重率',
+        'label': '文本改写',
+        'variables': (
+            ('text', '待降重原文'),
+            ('source_text', '查重报告/重复源'),
+            ('mode', '模式值'),
+            ('mode_label', '处理模式'),
+        ),
+        'required_variables': ('text', 'mode_label'),
+    },
     'correction.ai_review': {
         'page_id': 'correction',
         'page_label': '智能纠错',
-        'label': '开始智能纠错',
+        'label': 'AI 纠错',
         'variables': (
             ('text', '待检查文本'),
             ('citation_style', '引用规范'),

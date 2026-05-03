@@ -922,7 +922,7 @@ class OpenSkillsAdapterSkill:
         previous_record = dict(previous_record or {})
         available_scenes = list(manifest.get('scene_bindings', []))
         bound_scene_ids = previous_record.get('bound_scene_ids', previous_record.get('scene_bindings', []))
-        bound_scene_ids = _unique_text_list(bound_scene_ids, allowed=available_scenes)
+        bound_scene_ids = _unique_text_list(bound_scene_ids)
         if not bound_scene_ids:
             bound_scene_ids = list(available_scenes)
 
@@ -1049,7 +1049,7 @@ class OpenSkillsAdapterSkill:
         if global_enabled is not None:
             record['global_enabled'] = bool(global_enabled) and bool(record.get('global_hook', False))
         if bound_scene_ids is not None:
-            record['bound_scene_ids'] = _unique_text_list(bound_scene_ids, allowed=record.get('scene_bindings', []))
+            record['bound_scene_ids'] = _unique_text_list(bound_scene_ids)
         if last_checked_at is not None:
             record['last_checked_at'] = _coerce_int(last_checked_at, 0)
         record['updated_at'] = _now_ts()

@@ -91,7 +91,7 @@ class PaperWriter:
         return self.api.call_sync(
             prompt,
             system,
-            usage_context=self._usage_context('', 'format_references'),
+            usage_context=self._usage_context('paper_write.references', 'format_references'),
         )
 
     def improve_paragraph(self, paragraph, direction='学术化'):
@@ -110,5 +110,5 @@ class PaperWriter:
         return self.api.call_sync(
             prompt,
             system,
-            usage_context=self._usage_context('', 'improve_paragraph'),
+            usage_context=self._usage_context('paper_write.section', 'improve_paragraph'),
         )
