@@ -1603,6 +1603,160 @@ class ModernButton(tk.Button):
         self.configure(**style_map)
 
 
+class ToggleSwitch(tk.Frame):
+    """圆角矩形开关组件，替代传统 Checkbutton。"""
+
+    def __init__(
+        self,
+        parent,
+        variable=None,
+        command=None,
+        width=44,
+        height=24,
+        **kwargs
+    ):
+        bg = kwargs.pop('bg', COLORS['bg_main'])
+        super().__init__(parent, bg=bg, **kwargs)
+
+        self.variable = variable or tk.BooleanVar()
+        self.command = command
+        self.width = width
+        self.height = height
+        self.knob_radius = (height - 4) // 2
+        self.knob_padding = 2
+
+        self._animating = False
+        self._animation_step = 0
+        self._animation_steps = 8
+
+        self.canvas = tk.Canvas(
+            self,
+            width=width,
+            height=height,
+            bg=bg,
+            highlightthickness=0,
+            bd=0,
+            cursor='hand2',
+        )
+        self.canvas.pack()
+
+        self.track_id = None
+        self.knob_id = None
+
+        self._draw()
+        self.canvas.bind('<Button-1>', self._on_click)
+        self.variable.trace_add('write', self._on_variable_changed)
+
+    def _draw(self):
+        """绘制开关的轨道和滑块。"""
+        self.canvas.delete('all')
+        is_on = bool(self.variable.get())
+
+        track_color = COLORS['primary'] if is_on else COLORS['surface_alt']
+        knob_color = '#FFFFFF'
+
+        track_radius = self.height // 2
+        self.track_id = self._draw_rounded_rect(
+            0, 0, self.width, self.height, track_radius, fill=track_color, outline=''
+        )
+
+        if self._animating:
+            progress = self._animation_step / self._animation_steps
+            if not is_on:
+                progress = 1 - progress
+            knob_x = self.knob_padding + self.knob_radius + progress * (
+                self.width - 2 * self.knob_padding - 2 * self.knob_radius
+            )
+        else:
+            if is_on:
+                knob_x = self.width - self.knob_padding - self.knob_radius
+            else:
+                knob_x = self.knob_padding + self.knob_radius
+
+        knob_y = self.height // 2
+        self.knob_id = self.canvas.create_oval(
+            knob_x - self.knob_radius,
+            knob_y - self.knob_radius,
+            knob_x + self.knob_radius,
+            knob_y + self.knob_radius,
+            fill=knob_color,
+            outline='',
+        )
+
+    def _draw_rounded_rect(self, x1, y1, x2, y2, radius, **kwargs):
+        """绘制圆角矩形。"""
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1,
+        ]
+        return self.canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _on_click(self, event=None):
+        """点击切换状态。"""
+        if self._animating:
+            return
+        self.variable.set(not bool(self.variable.get()))
+        if callable(self.command):
+            try:
+                self.command()
+            except Exception:
+                pass
+
+    def _on_variable_changed(self, *args):
+        """变量改变时触发动画。"""
+        if self._animating:
+            return
+        self._start_animation()
+
+    def _start_animation(self):
+        """启动滑块动画。"""
+        self._animating = True
+        self._animation_step = 0
+        self._animate()
+
+    def _animate(self):
+        """执行动画的一帧。"""
+        if not self._animating:
+            return
+
+        self._animation_step += 1
+        self._draw()
+
+        if self._animation_step < self._animation_steps:
+            self.after(20, self._animate)
+        else:
+            self._animating = False
+            self._draw()
+
+    def configure(self, **kwargs):
+        """配置开关属性。"""
+        if 'variable' in kwargs:
+            self.variable = kwargs.pop('variable')
+            self.variable.trace_add('write', self._on_variable_changed)
+            self._draw()
+        if 'command' in kwargs:
+            self.command = kwargs.pop('command')
+        if 'state' in kwargs:
+            state = kwargs.pop('state')
+            if state == 'disabled':
+                self.canvas.configure(cursor='')
+                self.canvas.unbind('<Button-1>')
+            else:
+                self.canvas.configure(cursor='hand2')
+                self.canvas.bind('<Button-1>', self._on_click)
+        super().configure(**kwargs)
+
+
 class ToolIconButton(ModernButton):
     """顶部工具按钮。"""
 

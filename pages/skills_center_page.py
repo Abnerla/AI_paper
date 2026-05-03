@@ -25,6 +25,7 @@ from modules.ui_components import (
     FONTS,
     ResponsiveButtonBar,
     ScrollablePage,
+    ToggleSwitch,
 )
 
 
@@ -217,30 +218,36 @@ class SkillsCenterPanel:
 
         toggle_card = CardFrame(self.detail_inner, title='启用状态', padding=16)
         toggle_card.pack(fill=tk.X, pady=(14, 0))
-        tk.Checkbutton(
-            toggle_card.inner,
+
+        enable_row = tk.Frame(toggle_card.inner, bg=COLORS['card_bg'])
+        enable_row.pack(anchor='w', fill=tk.X)
+        tk.Label(
+            enable_row,
             text='启用技能',
-            variable=self.enabled_var,
             font=FONTS['body_bold'],
             fg=COLORS['text_main'],
             bg=COLORS['card_bg'],
-            activebackground=COLORS['card_bg'],
-            activeforeground=COLORS['text_main'],
-            selectcolor=COLORS['card_bg'],
-            anchor='w',
-        ).pack(anchor='w')
-        tk.Checkbutton(
-            toggle_card.inner,
+        ).pack(side=tk.LEFT)
+        ToggleSwitch(
+            enable_row,
+            variable=self.enabled_var,
+            bg=COLORS['card_bg'],
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        global_row = tk.Frame(toggle_card.inner, bg=COLORS['card_bg'])
+        global_row.pack(anchor='w', fill=tk.X, pady=(8, 0))
+        tk.Label(
+            global_row,
             text='全局生效',
-            variable=self.global_var,
             font=FONTS['body'],
             fg=COLORS['text_main'],
             bg=COLORS['card_bg'],
-            activebackground=COLORS['card_bg'],
-            activeforeground=COLORS['text_main'],
-            selectcolor=COLORS['card_bg'],
-            anchor='w',
-        ).pack(anchor='w', pady=(8, 0))
+        ).pack(side=tk.LEFT)
+        ToggleSwitch(
+            global_row,
+            variable=self.global_var,
+            bg=COLORS['card_bg'],
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         self.scene_checks_frame = tk.Frame(toggle_card.inner, bg=COLORS['card_bg'])
         self.scene_checks_frame.pack(fill=tk.X, pady=(10, 0))
@@ -698,22 +705,26 @@ class SkillsCenterPanel:
                 display_name = scene_id
             var = tk.BooleanVar(value=scene_id in selected_set)
             self.scene_vars[scene_id] = var
-            cb = tk.Checkbutton(
-                self.scene_checks_frame,
+
+            row = tk.Frame(self.scene_checks_frame, bg=COLORS['card_bg'])
+            row.pack(anchor='w', fill=tk.X, pady=2)
+            tk.Label(
+                row,
                 text=display_name,
-                variable=var,
                 font=FONTS['body'],
                 fg=COLORS['text_main'],
                 bg=COLORS['card_bg'],
-                activebackground=COLORS['card_bg'],
-                activeforeground=COLORS['text_main'],
-                selectcolor=COLORS['card_bg'],
-                anchor='w',
+            ).pack(side=tk.LEFT)
+            switch = ToggleSwitch(
+                row,
+                variable=var,
+                bg=COLORS['card_bg'],
             )
-            cb.pack(anchor='w')
+            switch.pack(side=tk.LEFT, padx=(10, 0))
+
             # 标记推荐绑定（manifest 声明的场景）
             if scene_id in default_set and scene_id not in selected_set:
-                cb.select()
+                var.set(True)
 
     def _render_action_tabs(self, actions):
         for child in self.action_tabs_bar.winfo_children():
@@ -813,18 +824,20 @@ class SkillsCenterPanel:
             self._action_widgets[field_id] = {'type': field_type, 'variable': var}
         elif field_type == 'checkbox':
             var = tk.BooleanVar(value=bool(field.get('default', False)))
-            tk.Checkbutton(
-                wrapper,
+            row = tk.Frame(wrapper, bg=COLORS['card_bg'])
+            row.pack(anchor='w', fill=tk.X, pady=(6, 0))
+            tk.Label(
+                row,
                 text=field.get('help', '') or '启用',
-                variable=var,
                 font=FONTS['body'],
                 fg=COLORS['text_main'],
                 bg=COLORS['card_bg'],
-                activebackground=COLORS['card_bg'],
-                activeforeground=COLORS['text_main'],
-                selectcolor=COLORS['card_bg'],
-                anchor='w',
-            ).pack(anchor='w', pady=(6, 0))
+            ).pack(side=tk.LEFT)
+            ToggleSwitch(
+                row,
+                variable=var,
+                bg=COLORS['card_bg'],
+            ).pack(side=tk.LEFT, padx=(10, 0))
             self._action_widgets[field_id] = {'type': field_type, 'variable': var}
         else:
             var = tk.StringVar(value='' if field.get('default', None) is None else str(field.get('default')))

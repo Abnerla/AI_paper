@@ -22,6 +22,7 @@ from modules.ui_components import (
     ModernButton,
     ScrollablePage,
     SkillCardGrid,
+    ToggleSwitch,
 )
 
 
@@ -1024,17 +1025,19 @@ class RepoManagePanel:
         def on_toggle(rid=repo_id, var=enabled_var):
             self.config.update_skills_repository(rid, {'enabled': var.get()})
 
-        tk.Checkbutton(
+        enable_label = tk.Label(
             header,
             text='启用',
-            variable=enabled_var,
-            command=on_toggle,
             font=FONTS['small'],
             fg=COLORS['text_main'],
             bg=COLORS['surface_alt'],
-            activebackground=COLORS['surface_alt'],
-            activeforeground=COLORS['text_main'],
-            selectcolor=COLORS['surface_alt'],
+        )
+        enable_label.pack(side=tk.RIGHT, padx=(0, 4))
+        ToggleSwitch(
+            header,
+            variable=enabled_var,
+            command=on_toggle,
+            bg=COLORS['surface_alt'],
         ).pack(side=tk.RIGHT)
 
         url_text = repo.get('url', '')

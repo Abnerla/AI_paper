@@ -17,6 +17,7 @@ from modules.ui_components import (
     ModernButton,
     ModernEntry,
     ScrollablePage,
+    ToggleSwitch,
 )
 from modules.provider_registry import (
     AUTH_OPTION_CUSTOM,
@@ -915,19 +916,18 @@ class APIConfigPage:
         ).pack(side=tk.LEFT, padx=(0, 10))
         enable_user_agent_spoof = tk.BooleanVar(value=bool(cfg.get('enable_user_agent_spoof', False)))
         self._entries[form_key]['enable_user_agent_spoof'] = enable_user_agent_spoof
-        tk.Checkbutton(
+        tk.Label(
             user_agent_row,
             text='开启浏览器风格请求头',
-            variable=enable_user_agent_spoof,
             font=FONTS['body'],
             fg=COLORS['text_main'],
             bg=COLORS['card_bg'],
-            activebackground=COLORS['card_bg'],
-            selectcolor=COLORS['card_bg'],
-            bd=0,
-            highlightthickness=0,
-            cursor='hand2',
         ).pack(side=tk.LEFT)
+        ToggleSwitch(
+            user_agent_row,
+            variable=enable_user_agent_spoof,
+            bg=COLORS['card_bg'],
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
     def _build_json_section(self, parent, form_key):
         def make_json_format_button(title_row):
@@ -954,20 +954,20 @@ class APIConfigPage:
         for key, label in check_defs:
             var = tk.BooleanVar(value=bool(cfg.get(key, False)))
             self._entries[form_key][key] = var
-            cb = tk.Checkbutton(
-                checks_frame,
+            row = tk.Frame(checks_frame, bg=COLORS['card_bg'])
+            row.pack(side=tk.LEFT, padx=(0, 18))
+            tk.Label(
+                row,
                 text=label,
-                variable=var,
                 font=FONTS['body'],
                 fg=COLORS['text_main'],
                 bg=COLORS['card_bg'],
-                activebackground=COLORS['card_bg'],
-                selectcolor=COLORS['card_bg'],
-                bd=0,
-                highlightthickness=0,
-                cursor='hand2',
-            )
-            cb.pack(side=tk.LEFT, padx=(0, 18))
+            ).pack(side=tk.LEFT)
+            ToggleSwitch(
+                row,
+                variable=var,
+                bg=COLORS['card_bg'],
+            ).pack(side=tk.LEFT, padx=(10, 0))
 
         txt_frame = tk.Frame(inner, bg=COLORS['card_bg'])
         txt_frame.pack(fill=tk.X, pady=(6, 0))

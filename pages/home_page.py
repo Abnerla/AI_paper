@@ -34,6 +34,7 @@ from modules.ui_components import (
     ResponsiveButtonBar,
     refresh_home_shell_button,
     THEMES,
+    ToggleSwitch,
     ToolIconButton,
     load_image,
 )
@@ -2443,16 +2444,18 @@ class HomePage:
 
         enabled_shell = tk.Frame(form, bg=COLORS['card_bg'])
         enabled_shell.grid(row=3, column=2, sticky='w', pady=(6, 0))
-        tk.Checkbutton(
+        tk.Label(
             enabled_shell,
             text='启用规则',
-            variable=self.pricing_enabled_var,
             font=FONTS['body'],
             fg=COLORS['text_main'],
             bg=COLORS['card_bg'],
-            activebackground=COLORS['card_bg'],
-            selectcolor=COLORS['card_bg'],
-        ).pack(anchor='w')
+        ).pack(side=tk.LEFT)
+        ToggleSwitch(
+            enabled_shell,
+            variable=self.pricing_enabled_var,
+            bg=COLORS['card_bg'],
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         action_shell = tk.Frame(form, bg=COLORS['card_bg'])
         action_shell.grid(row=3, column=3, sticky='e', pady=(6, 0))

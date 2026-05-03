@@ -30,6 +30,7 @@ from modules.ui_components import (
     set_ellipsized_label_text,
     show_tooltip,
     THEMES,
+    ToggleSwitch,
 )
 from modules.workspace_state import WorkspaceStateMixin
 
@@ -2057,19 +2058,18 @@ class TextTransformPageBase(WorkspaceStateMixin):
 
         include_row = tk.Frame(shell, bg=COLORS['card_bg'])
         include_row.pack(fill=tk.X, pady=(12, 0))
-        tk.Checkbutton(
+        tk.Label(
             include_row,
             text='纳入本次执行',
-            variable=include_var,
             font=FONTS['body'],
-            bg=COLORS['card_bg'],
             fg=COLORS['text_main'],
-            activebackground=COLORS['card_bg'],
-            activeforeground=COLORS['text_main'],
-            selectcolor=COLORS['card_bg'],
-            highlightthickness=0,
-            bd=0,
-        ).pack(anchor='w')
+            bg=COLORS['card_bg'],
+        ).pack(side=tk.LEFT)
+        ToggleSwitch(
+            include_row,
+            variable=include_var,
+            bg=COLORS['card_bg'],
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         action_row = tk.Frame(shell, bg=COLORS['card_bg'])
         action_row.pack(fill=tk.X, pady=(14, 0))
