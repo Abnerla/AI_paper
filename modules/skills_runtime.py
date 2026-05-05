@@ -1047,7 +1047,12 @@ class OpenSkillsAdapterSkill:
         if enabled is not None:
             record['enabled'] = bool(enabled)
         if global_enabled is not None:
-            record['global_enabled'] = bool(global_enabled) and bool(record.get('global_hook', False))
+            record['global_enabled'] = bool(global_enabled)
+            # global_hook=False 时 global_enabled=True 表示自动绑定全部声明场景
+            if record['global_enabled'] and not record.get('global_hook', False):
+                record['bound_scene_ids'] = list(record.get('scene_bindings', []))
+            elif not record['global_enabled'] and not record.get('global_hook', False):
+                record['bound_scene_ids'] = []
         if bound_scene_ids is not None:
             allowed_scenes = record.get('scene_bindings', [])
             record['bound_scene_ids'] = _unique_text_list(bound_scene_ids, allowed=allowed_scenes)
@@ -1091,14 +1096,15 @@ class OpenSkillsAdapterSkill:
                     'actions_count': len(list(manifest.get('actions', []) or [])),
                 }
             )
-        # 若 global_hook 为 False，强制关闭 global_enabled，保持数据一致
-        if not record.get('global_hook', False):
-            record['global_enabled'] = False
         skill_id = str(record.get('id', '') or '').strip()
         registry_entry = dict(registry_entry or {})
         installed_version = normalize_version(record.get('version', 'v0.0.0'))
         latest_version = normalize_version(registry_entry.get('version', installed_version or 'v0.0.0'))
         has_update = bool(registry_entry) and compare_versions(installed_version, latest_version) < 0
+        # global_hook=False 时 global_enabled 表示"自动绑定全部声明场景"
+        effective_bound = _unique_text_list(record.get('bound_scene_ids', []), allowed=record.get('scene_bindings', []))
+        if record.get('global_enabled', False) and not record.get('global_hook', False):
+            effective_bound = list(record.get('scene_bindings', []))
         return {
             **record,
             'id': skill_id,
@@ -1110,7 +1116,7 @@ class OpenSkillsAdapterSkill:
             'has_update': has_update,
             'is_installed': bool(skill_id),
             'is_local_only': bool(record.get('source_type') in {'zip', 'directory'} and not registry_entry),
-            'bound_scene_ids': _unique_text_list(record.get('bound_scene_ids', []), allowed=record.get('scene_bindings', [])),
+            'bound_scene_ids': effective_bound,
         }
 
     def list_installed_skills(self, registry_payload=None):
@@ -1201,18 +1207,26 @@ class OpenSkillsAdapterSkill:
         records = self.list_installed_skills()
         result = []
         for record in records:
+            skill_id = record.get('id', '')
             if record.get('is_missing_package'):
                 continue
             if not record.get('enabled', False):
                 continue
             if scope == 'global':
+                # 真正全局：需要 manifest 声明 global_hook 且用户开启 global_enabled
                 if not record.get('global_enabled', False) or not record.get('global_hook', False):
                     continue
             elif scope == 'scene':
                 if not scene_id:
                     continue
-                if scene_id not in set(record.get('bound_scene_ids', [])):
-                    continue
+                # global_enabled=True 且 global_hook=False 时，自动匹配所有声明场景
+                if record.get('global_enabled', False) and not record.get('global_hook', False):
+                    if scene_id not in set(record.get('scene_bindings', [])):
+                        continue
+                else:
+                    bound = record.get('bound_scene_ids', [])
+                    if scene_id not in set(bound):
+                        continue
             else:
                 continue
             result.append(record)

@@ -261,6 +261,7 @@ class SkillsCenterPanel:
             global_row,
             variable=self.global_var,
             bg=COLORS['card_bg'],
+            command=self._on_global_toggle,
         )
         global_switch.pack(side=tk.LEFT, padx=(10, 0))
         self._global_switch = global_switch
@@ -697,19 +698,14 @@ class SkillsCenterPanel:
 
         self.enabled_var.set(bool(item.get('enabled', False)))
         self.global_var.set(bool(item.get('global_enabled', False)))
-        # 当 global_hook=False 时禁用全局生效开关，避免用户困惑
-        if not item.get('global_hook', False):
-            self._global_switch.configure(state='disabled')
-            self.global_var.set(False)
-        else:
-            self._global_switch.configure(state='normal')
-        self._render_scene_checks(item.get('scene_bindings', []), selected=item.get('bound_scene_ids', []))
+        self._global_switch.configure(state='normal')
+        self._render_scene_checks(item.get('scene_bindings', []), selected=item.get('bound_scene_ids', []), global_active=bool(item.get('global_enabled', False)))
         manifest = item.get('manifest')
         actions = list((manifest or {}).get('actions', []) or [])
         self._render_action_tabs(actions)
         self._render_action_form(actions)
 
-    def _render_scene_checks(self, scene_bindings, selected=None):
+    def _render_scene_checks(self, scene_bindings, selected=None, global_active=False):
         for child in self.scene_checks_frame.winfo_children():
             child.destroy()
         self.scene_vars = {}
@@ -733,6 +729,17 @@ class SkillsCenterPanel:
                 anchor='w',
             ).pack(fill=tk.X)
             return
+        # 全局生效时：自动全选所有场景，禁用手动勾选
+        if global_active:
+            hint = tk.Label(
+                self.scene_checks_frame,
+                text='全局生效已开启，自动应用于全部声明场景。',
+                font=FONTS['small'],
+                fg=COLORS['primary'],
+                bg=COLORS['card_bg'],
+                anchor='w',
+            )
+            hint.pack(fill=tk.X, pady=(0, 4))
         for scene_id in supported_scenes:
             scene_def = SCENE_DEFS.get(scene_id, {})
             page_label = scene_def.get('page_label', '')
@@ -745,7 +752,8 @@ class SkillsCenterPanel:
                 display_name = page_label
             else:
                 display_name = scene_id
-            var = tk.BooleanVar(value=scene_id in selected_set)
+            # 全局生效时全选，否则按实际绑定
+            var = tk.BooleanVar(value=global_active or scene_id in selected_set)
             self.scene_vars[scene_id] = var
 
             row = tk.Frame(self.scene_checks_frame, bg=COLORS['card_bg'])
@@ -754,7 +762,7 @@ class SkillsCenterPanel:
                 row,
                 text=display_name,
                 font=FONTS['body'],
-                fg=COLORS['text_main'],
+                fg=COLORS['text_main'] if not global_active else COLORS['text_sub'],
                 bg=COLORS['card_bg'],
             ).pack(side=tk.LEFT)
             switch = ToggleSwitch(
@@ -763,6 +771,8 @@ class SkillsCenterPanel:
                 bg=COLORS['card_bg'],
             )
             switch.pack(side=tk.LEFT, padx=(10, 0))
+            if global_active:
+                switch.configure(state='disabled')
 
     def _render_action_tabs(self, actions):
         self.action_tabs_bar.clear()
@@ -1042,6 +1052,20 @@ class SkillsCenterPanel:
             text = '' if result is None else str(result)
         self.action_result_text.delete('1.0', tk.END)
         self.action_result_text.insert('1.0', text)
+
+    def _on_global_toggle(self):
+        """全局生效开关切换时，实时刷新场景勾选状态。"""
+        global_active = self.global_var.get()
+        for scene_id, var in self.scene_vars.items():
+            var.set(global_active)
+        # 重新渲染场景区域以更新禁用/启用状态
+        item = self._get_selected_skill()
+        if item:
+            self._render_scene_checks(
+                item.get('scene_bindings', []),
+                selected=item.get('bound_scene_ids', []),
+                global_active=global_active,
+            )
 
     def _save_current_skill_state(self):
         item = self._get_selected_skill()

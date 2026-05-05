@@ -8,7 +8,12 @@ from tkinter import messagebox, ttk
 
 from modules.aux_tools import AuxTools
 from modules.prompt_center import PromptCenter
-from modules.report_importer import ImportSession, ParagraphAnnotation, normalize_block_text
+from modules.report_importer import (
+    ImportSession,
+    ParagraphAnnotation,
+    normalize_block_text,
+    split_document_paragraphs,
+)
 from modules.task_runner import TaskRunner
 from pages.home_support import ensure_model_configured
 from modules.ui_components import (
@@ -244,6 +249,9 @@ class TextTransformPageBase(WorkspaceStateMixin):
         self._annotation_tag_names = set()
         self._annotation_popup = None
         self._annotation_layout_job = None
+        self._suppress_import_session_clear = False
+        self.manual_annotations = []
+        self.manual_annotation_base_text = ''
         self._init_workspace_state_support()
 
         self.input_text = None
@@ -896,6 +904,7 @@ class TextTransformPageBase(WorkspaceStateMixin):
         input_frame, self.input_text = create_scrolled_text(left_card.inner, height=20)
         input_frame.pack(fill=tk.BOTH, expand=True)
         self._register_editable_text(self.input_text, self.INPUT_PLACEHOLDER)
+        self._bind_input_context_menu()
 
         right_card = CardFrame(body, title=None if self.SHOW_OUTPUT_HEADER_REPLACE_ACTION else self.OUTPUT_CARD_TITLE)
         if self.SHOW_OUTPUT_HEADER_REPLACE_ACTION:
@@ -1568,6 +1577,121 @@ class TextTransformPageBase(WorkspaceStateMixin):
             widget.bind('<<Paste>>', lambda _event: self.frame.after_idle(self._schedule_workspace_state_save), add='+')
             widget.bind('<<Cut>>', lambda _event: self.frame.after_idle(self._schedule_workspace_state_save), add='+')
 
+    # -- 右键段落标记 --
+
+    def _bind_input_context_menu(self):
+        if self.input_text is None:
+            return
+        self.input_text.bind('<Button-3>', self._show_input_context_menu)
+
+    def _show_input_context_menu(self, event):
+        try:
+            sel_start = self.input_text.index(tk.SEL_FIRST)
+            sel_end = self.input_text.index(tk.SEL_LAST)
+        except tk.TclError:
+            return 'break'
+        if not sel_start or not sel_end:
+            return 'break'
+
+        menu = tk.Menu(self.frame, tearoff=0)
+        annotation_menu = tk.Menu(menu, tearoff=0)
+        for risk_key, risk_label in self.ANNOTATION_RISK_LABELS.items():
+            annotation_menu.add_command(
+                label=risk_label,
+                command=lambda r=risk_key: self._create_manual_annotation(r),
+            )
+        menu.add_cascade(label='段落标记', menu=annotation_menu)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    def _create_manual_annotation(self, risk_level):
+        try:
+            sel_start = self.input_text.index(tk.SEL_FIRST)
+            sel_end = self.input_text.index(tk.SEL_LAST)
+        except tk.TclError:
+            return
+
+        start_offset = self._tk_index_to_char_offset(sel_start)
+        end_offset = self._tk_index_to_char_offset(sel_end)
+        if end_offset <= start_offset:
+            return
+
+        for existing in self._get_all_annotations():
+            if self._annotations_overlap(start_offset, end_offset, existing.start, existing.end):
+                messagebox.showwarning('提示', '选中区域与已有标注重叠，请调整选择范围。', parent=self.frame)
+                return
+
+        paragraph_id = self._next_manual_paragraph_id()
+        if not self.manual_annotation_base_text:
+            self.manual_annotation_base_text = self._get_input_text()
+
+        selected_text = self.input_text.get(sel_start, sel_end).strip()[:80]
+        source_color_map = {
+            'high': 'red',
+            'medium': 'orange',
+            'low': 'purple',
+            'safe': 'black',
+        }
+
+        annotation = ParagraphAnnotation(
+            paragraph_id=paragraph_id,
+            section_path='',
+            start=start_offset,
+            end=end_offset,
+            risk_level=risk_level,
+            ai_score=None,
+            repeat_score=None,
+            duplicate_status='none',
+            source_color=source_color_map.get(risk_level, 'unknown'),
+            include_in_run=(risk_level != 'safe'),
+            source_excerpt=selected_text,
+            is_auto_generated=False,
+            is_user_modified=False,
+        )
+
+        self.manual_annotations.append(annotation)
+        self.manual_annotations.sort(key=lambda a: (a.start, a.end, a.paragraph_id))
+        self._render_import_annotations()
+        self._schedule_workspace_state_save()
+
+    def _tk_index_to_char_offset(self, index):
+        try:
+            resolved = self.input_text.index(index)
+        except tk.TclError:
+            return -1
+        text_before = self.input_text.get('1.0', resolved)
+        return len(text_before)
+
+    @staticmethod
+    def _annotations_overlap(start1, end1, start2, end2):
+        return start1 < end2 and start2 < end1
+
+    def _next_manual_paragraph_id(self):
+        max_num = 0
+        for a in self.manual_annotations:
+            if a.paragraph_id.startswith('manual-'):
+                try:
+                    num = int(a.paragraph_id.split('-', 1)[1])
+                    max_num = max(max_num, num)
+                except ValueError:
+                    pass
+        return f'manual-{max_num + 1}'
+
+    def _get_all_annotations(self):
+        report = self._get_import_annotations() if self.import_session else []
+        manual = list(self.manual_annotations or [])
+        return report + manual
+
+    def _find_annotation_by_id(self, paragraph_id):
+        for annotation in self._get_all_annotations():
+            if annotation.paragraph_id == paragraph_id:
+                return annotation
+        return None
+
     @staticmethod
     def _get_widget_text(widget):
         if widget is None:
@@ -1594,6 +1718,8 @@ class TextTransformPageBase(WorkspaceStateMixin):
             'annotations': [item.to_dict() for item in self._get_import_annotations()],
             'annotation_overrides': dict(self.annotation_overrides),
             'selected_annotation_id': self.selected_annotation_id,
+            'manual_annotations': [item.to_dict() for item in self.manual_annotations],
+            'manual_annotation_base_text': self.manual_annotation_base_text,
         }
 
     def restore_workspace_state(self, state):
@@ -1650,14 +1776,38 @@ class TextTransformPageBase(WorkspaceStateMixin):
                     restored_annotations.append(annotation)
             if restored_annotations:
                 self.import_session.annotations = restored_annotations
+
+        self.manual_annotations = []
+        self.manual_annotation_base_text = str(state.get('manual_annotation_base_text', '') or '')
+        for item in state.get('manual_annotations', []):
+            annotation = ParagraphAnnotation.from_dict(item)
+            if annotation is not None:
+                self.manual_annotations.append(annotation)
+        self.manual_annotations.sort(key=lambda a: (a.start, a.end, a.paragraph_id))
+
         self._update_input_card_title()
         self.frame.after_idle(self._render_import_annotations)
         self._refresh_mode_cards()
 
     def _on_text_change(self, _event=None):
         self._mark_analysis_stale(self.STALE_ANALYSIS_TEXT)
-        if self.import_session and self._get_input_text() != self.import_session.original_text:
+        session_cleared = False
+        if (
+            self.import_session
+            and not self._suppress_import_session_clear
+            and self._get_input_text() != self.import_session.original_text
+        ):
             self._clear_import_session('原文区正文已修改，原报告标注已清除，请重新导入报告。')
+            session_cleared = True
+        if (
+            self.manual_annotations
+            and self._get_input_text() != self.manual_annotation_base_text
+        ):
+            self.manual_annotations = []
+            self.manual_annotation_base_text = ''
+            session_cleared = True
+        if session_cleared and self.manual_annotations:
+            self._render_import_annotations()
         self._schedule_annotation_layout()
 
     def _get_input_text(self):
@@ -1707,11 +1857,67 @@ class TextTransformPageBase(WorkspaceStateMixin):
         self.import_session = session
         self.annotation_overrides = {}
         self.selected_annotation_id = ''
+        self.manual_annotations = []
+        self.manual_annotation_base_text = ''
         self._update_input_card_title()
         self._render_import_annotations()
         if info_text and self.info_label is not None:
             self.info_label.configure(text=info_text, fg=COLORS['text_muted'])
         self._schedule_workspace_state_save()
+
+    def _rebase_import_session_to(self, new_text):
+        """将现有报告标注按段落 ID 对齐到新原文，已改写的段落标记为安全跳过。
+
+        段落数量不一致时返回 False，由调用方决定是否清除会话。"""
+        if not self.import_session:
+            return False
+        try:
+            new_paragraphs = split_document_paragraphs(new_text)
+            old_paragraphs = split_document_paragraphs(self.import_session.original_text)
+        except Exception:
+            return False
+        if len(new_paragraphs) != len(old_paragraphs):
+            return False
+
+        old_index = {item.paragraph_id: item for item in old_paragraphs}
+        annotation_index = {item.paragraph_id: item for item in self._get_import_annotations()}
+        rebuilt = []
+        for paragraph in new_paragraphs:
+            annotation = annotation_index.get(paragraph.paragraph_id)
+            if annotation is None:
+                continue
+            old_paragraph = old_index.get(paragraph.paragraph_id)
+            text_changed = old_paragraph is None or old_paragraph.text != paragraph.text
+            updated = ParagraphAnnotation.from_dict(annotation.to_dict())
+            updated.start = paragraph.start
+            updated.end = paragraph.end
+            updated.section_path = paragraph.section_path
+            if text_changed:
+                updated.risk_level = 'safe'
+                updated.include_in_run = False
+                updated.ai_score = None
+                updated.repeat_score = None
+                updated.duplicate_status = 'safe'
+                updated.source_color = 'gray'
+                updated.is_user_modified = True
+                updated.source_excerpt = paragraph.text.strip()[:80]
+                self.annotation_overrides[paragraph.paragraph_id] = {
+                    'risk_level': 'safe',
+                    'include_in_run': False,
+                    'ai_score': None,
+                    'repeat_score': None,
+                    'duplicate_status': 'safe',
+                    'is_user_modified': True,
+                }
+            rebuilt.append(updated)
+
+        self.import_session.original_text = normalize_block_text(new_text)
+        self._set_import_annotations(rebuilt)
+        if self.manual_annotations:
+            self.manual_annotation_base_text = normalize_block_text(new_text)
+        self._render_import_annotations()
+        self._schedule_workspace_state_save()
+        return True
 
     def _clear_import_session(self, info_text=''):
         self.import_session = None
@@ -1720,6 +1926,12 @@ class TextTransformPageBase(WorkspaceStateMixin):
         self._clear_annotation_visuals()
         self._close_annotation_editor()
         self._update_input_card_title()
+        if self.manual_annotations and self._get_input_text() == self.manual_annotation_base_text:
+            for annotation in self.manual_annotations:
+                if not self._should_render_annotation(annotation):
+                    continue
+                self._render_single_annotation(annotation)
+            self._schedule_annotation_layout()
         if info_text and self.info_label is not None:
             self.info_label.configure(text=info_text, fg=COLORS['warning'])
         self._schedule_workspace_state_save()
@@ -1793,37 +2005,50 @@ class TextTransformPageBase(WorkspaceStateMixin):
 
     def _render_import_annotations(self):
         self._clear_annotation_visuals()
-        if not self.import_session or self.input_text is None:
-            return
-        if self._get_input_text() != self.import_session.original_text:
+        if self.input_text is None:
             return
 
-        for annotation in self._get_import_annotations():
-            if not self._should_render_annotation(annotation):
-                continue
-            tag_name = f'annotation::{annotation.paragraph_id}'
-            self._annotation_tag_names.add(tag_name)
-            self.input_text.tag_configure(
-                tag_name,
-                background=self._get_annotation_highlight_color(annotation),
-                foreground=COLORS['text_main'],
-            )
-            self.input_text.tag_add(
-                tag_name,
-                f'1.0+{annotation.start}c',
-                f'1.0+{annotation.end}c',
-            )
-            self.input_text.tag_bind(
-                tag_name,
-                '<Button-1>',
-                lambda _event, paragraph_id=annotation.paragraph_id: self._open_annotation_editor(paragraph_id),
-            )
-            badge = self._build_annotation_badge(annotation)
-            if badge is not None:
-                self._annotation_badges[annotation.paragraph_id] = badge
+        current_text = self._get_input_text()
+
+        if self.import_session and current_text == self.import_session.original_text:
+            for annotation in self._get_import_annotations():
+                if not self._should_render_annotation(annotation):
+                    continue
+                self._render_single_annotation(annotation)
+
+        if self.manual_annotations and current_text == self.manual_annotation_base_text:
+            for annotation in self.manual_annotations:
+                if not self._should_render_annotation(annotation):
+                    continue
+                self._render_single_annotation(annotation)
+
         self._schedule_annotation_layout()
 
+    def _render_single_annotation(self, annotation):
+        tag_name = f'annotation::{annotation.paragraph_id}'
+        self._annotation_tag_names.add(tag_name)
+        self.input_text.tag_configure(
+            tag_name,
+            background=self._get_annotation_highlight_color(annotation),
+            foreground=COLORS['text_main'],
+        )
+        self.input_text.tag_add(
+            tag_name,
+            f'1.0+{annotation.start}c',
+            f'1.0+{annotation.end}c',
+        )
+        self.input_text.tag_bind(
+            tag_name,
+            '<Button-1>',
+            lambda _event, paragraph_id=annotation.paragraph_id: self._open_annotation_editor(paragraph_id),
+        )
+        badge = self._build_annotation_badge(annotation)
+        if badge is not None:
+            self._annotation_badges[annotation.paragraph_id] = badge
+
     def _should_render_annotation(self, annotation):
+        if not annotation.is_auto_generated:
+            return True
         if self._is_plagiarism_annotation_page():
             if annotation.risk_level == 'safe' and not annotation.is_user_modified:
                 return False
@@ -1882,6 +2107,9 @@ class TextTransformPageBase(WorkspaceStateMixin):
     def _format_annotation_badge_text(self, annotation):
         prefix = '跳过 | ' if not annotation.include_in_run else ''
         source_color = self._normalize_annotation_source_color(getattr(annotation, 'source_color', 'unknown'))
+        if not annotation.is_auto_generated:
+            risk_label = self.ANNOTATION_RISK_LABELS.get(annotation.risk_level, '')
+            return f'{prefix}{risk_label}' if risk_label else ''
         if self._is_ai_annotation_page():
             if annotation.ai_score is None:
                 if source_color != 'unknown' and annotation.risk_level != 'safe':
@@ -1908,6 +2136,13 @@ class TextTransformPageBase(WorkspaceStateMixin):
 
     def _format_annotation_tooltip(self, annotation):
         source_color = self._normalize_annotation_source_color(getattr(annotation, 'source_color', 'unknown'))
+        if not annotation.is_auto_generated:
+            lines = [
+                f'风险级别：{self.ANNOTATION_RISK_LABELS.get(annotation.risk_level, annotation.risk_level)}',
+                f'本次是否执行：{self._format_yes_no_flag(annotation.include_in_run)}',
+                '来源：手动标记',
+            ]
+            return '\n'.join(lines)
         if self._is_ai_annotation_page():
             lines = [
                 f'AI率：{self._format_annotation_score(annotation.ai_score)}',
@@ -1951,7 +2186,7 @@ class TextTransformPageBase(WorkspaceStateMixin):
         if self.input_text is None:
             return
         widget_width = max(self.input_text.winfo_width(), 100)
-        annotations = {item.paragraph_id: item for item in self._get_import_annotations()}
+        annotations = {item.paragraph_id: item for item in self._get_all_annotations()}
         for paragraph_id, badge in list(self._annotation_badges.items()):
             annotation = annotations.get(paragraph_id)
             if annotation is None:
@@ -2000,7 +2235,7 @@ class TextTransformPageBase(WorkspaceStateMixin):
         return shell
 
     def _open_annotation_editor(self, paragraph_id):
-        annotation = next((item for item in self._get_import_annotations() if item.paragraph_id == paragraph_id), None)
+        annotation = self._find_annotation_by_id(paragraph_id)
         if annotation is None:
             return
 
@@ -2151,7 +2386,6 @@ class TextTransformPageBase(WorkspaceStateMixin):
         popup.geometry(f'+{x}+{y}')
 
     def _save_annotation_editor(self, paragraph_id, risk_label_map, risk_var, include_var, *, ai_var=None, repeat_var=None, duplicate_var=None):
-        updated_annotations = []
         duplicate_text_map = {
             '标红': 'red',
             '疑似重复': 'suspect',
@@ -2182,31 +2416,53 @@ class TextTransformPageBase(WorkspaceStateMixin):
         if duplicate_var is not None:
             chosen_duplicate = duplicate_text_map.get(duplicate_var.get(), 'none')
 
-        for annotation in self._get_import_annotations():
-            if annotation.paragraph_id != paragraph_id:
-                updated_annotations.append(annotation)
-                continue
-            updated_annotation = ParagraphAnnotation.from_dict(annotation.to_dict())
-            updated_annotation.risk_level = chosen_risk
-            updated_annotation.include_in_run = bool(include_var.get())
-            updated_annotation.is_user_modified = True
-            if ai_var is not None:
-                updated_annotation.ai_score = ai_score_value
-            if repeat_var is not None:
-                updated_annotation.repeat_score = repeat_score_value
-            if duplicate_var is not None:
-                updated_annotation.duplicate_status = chosen_duplicate
-            updated_annotations.append(updated_annotation)
-            self.annotation_overrides[paragraph_id] = {
-                'risk_level': updated_annotation.risk_level,
-                'include_in_run': updated_annotation.include_in_run,
-                'ai_score': updated_annotation.ai_score,
-                'repeat_score': updated_annotation.repeat_score,
-                'duplicate_status': updated_annotation.duplicate_status,
-                'is_user_modified': True,
-            }
+        is_manual = any(a.paragraph_id == paragraph_id for a in self.manual_annotations)
 
-        self._set_import_annotations(updated_annotations)
+        if is_manual:
+            updated = []
+            for annotation in self.manual_annotations:
+                if annotation.paragraph_id != paragraph_id:
+                    updated.append(annotation)
+                    continue
+                updated_annotation = ParagraphAnnotation.from_dict(annotation.to_dict())
+                updated_annotation.risk_level = chosen_risk
+                updated_annotation.include_in_run = bool(include_var.get())
+                updated_annotation.is_user_modified = True
+                if ai_var is not None:
+                    updated_annotation.ai_score = ai_score_value
+                if repeat_var is not None:
+                    updated_annotation.repeat_score = repeat_score_value
+                if duplicate_var is not None:
+                    updated_annotation.duplicate_status = chosen_duplicate
+                updated.append(updated_annotation)
+            self.manual_annotations = sorted(updated, key=lambda a: (a.start, a.end, a.paragraph_id))
+        else:
+            updated_annotations = []
+            for annotation in self._get_import_annotations():
+                if annotation.paragraph_id != paragraph_id:
+                    updated_annotations.append(annotation)
+                    continue
+                updated_annotation = ParagraphAnnotation.from_dict(annotation.to_dict())
+                updated_annotation.risk_level = chosen_risk
+                updated_annotation.include_in_run = bool(include_var.get())
+                updated_annotation.is_user_modified = True
+                if ai_var is not None:
+                    updated_annotation.ai_score = ai_score_value
+                if repeat_var is not None:
+                    updated_annotation.repeat_score = repeat_score_value
+                if duplicate_var is not None:
+                    updated_annotation.duplicate_status = chosen_duplicate
+                updated_annotations.append(updated_annotation)
+                self.annotation_overrides[paragraph_id] = {
+                    'risk_level': updated_annotation.risk_level,
+                    'include_in_run': updated_annotation.include_in_run,
+                    'ai_score': updated_annotation.ai_score,
+                    'repeat_score': updated_annotation.repeat_score,
+                    'duplicate_status': updated_annotation.duplicate_status,
+                    'is_user_modified': True,
+                }
+            self._set_import_annotations(updated_annotations)
+
         self._close_annotation_editor()
         self._render_import_annotations()
         self._schedule_workspace_state_save()
@@ -2425,8 +2681,9 @@ class TextTransformPageBase(WorkspaceStateMixin):
         self._mark_analysis_stale('处理失败，核验结果与差异预览已失效。')
 
     def _transform_text_with_import_annotations(self, text, mode):
-        if self.import_session and self._get_import_annotations():
-            return self._transform_with_annotations(text, mode, self._get_import_annotations())
+        all_annotations = self._get_all_annotations()
+        if all_annotations:
+            return self._transform_with_annotations(text, mode, all_annotations)
         return self._transform_text(text, mode)
 
     def _transform_with_annotations(self, text, mode, annotations):
@@ -2444,6 +2701,8 @@ class TextTransformPageBase(WorkspaceStateMixin):
                 'matched_annotation_count': self.import_session.matched_count,
                 'total_annotation_count': len(self._get_import_annotations()),
             })
+        if self.manual_annotations:
+            extra['manual_annotation_count'] = len(self.manual_annotations)
         if self.current_paper_title:
             extra['paper_title'] = self.current_paper_title
         return extra
@@ -2474,16 +2733,34 @@ class TextTransformPageBase(WorkspaceStateMixin):
             messagebox.showwarning('提示', self.REPLACE_EMPTY_WARNING, parent=self.frame)
             return
 
-        self._set_text_value(self.input_text, result)
+        rebased = False
         if self.import_session:
-            self._clear_import_session('原文区已被处理结果替换，原报告标注已清除。')
-        self.info_label.configure(text=self.REPLACE_INFO_TEXT, fg=COLORS['text_muted'])
+            self._suppress_import_session_clear = True
+            try:
+                self._set_text_value(self.input_text, result)
+                rebased = self._rebase_import_session_to(self._get_input_text())
+            finally:
+                self._suppress_import_session_clear = False
+            if not rebased:
+                self._clear_import_session('原文区已被处理结果替换，原报告标注已清除。')
+        else:
+            self._set_text_value(self.input_text, result)
+
+        if rebased:
+            self.info_label.configure(
+                text='原文区已更新为处理结果，已对齐原报告标注，已处理段落标记为安全。',
+                fg=COLORS['text_muted'],
+            )
+        else:
+            self.info_label.configure(text=self.REPLACE_INFO_TEXT, fg=COLORS['text_muted'])
         self._mark_analysis_stale('原文已被结果替换，请重新核验或刷新差异视图。')
 
     def _reset_input_area(self):
         self._set_input_text('', 'manual', '', paper_title='')
         if self.import_session:
             self._clear_import_session()
+        self.manual_annotations = []
+        self.manual_annotation_base_text = ''
         if self.info_label is not None:
             self.info_label.configure(text=self.INPUT_RESET_INFO_TEXT, fg=COLORS['text_sub'])
         self._mark_analysis_stale(self.INPUT_RESET_STALE_TEXT)
