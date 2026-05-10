@@ -3,6 +3,8 @@
 论文写作模块。
 """
 
+import json
+
 from modules.prompt_center import PromptCenter
 
 
@@ -40,6 +42,24 @@ class PaperWriter:
             prompt,
             system,
             usage_context=self._usage_context('paper_write.outline', 'generate_outline'),
+        )
+
+    def import_outline_with_ai(self, document_blocks):
+        """用模型识别导入文档的大纲结构。"""
+        if isinstance(document_blocks, str):
+            blocks_text = document_blocks
+        else:
+            blocks_text = json.dumps(document_blocks or [], ensure_ascii=False, separators=(',', ':'))
+        system, prompt = self._render_scene(
+            'paper_write.import_outline',
+            {
+                'document_blocks': blocks_text[:60000],
+            },
+        )
+        return self.api.call_sync(
+            prompt,
+            system,
+            usage_context=self._usage_context('paper_write.import_outline', 'import_outline'),
         )
 
     def write_section(

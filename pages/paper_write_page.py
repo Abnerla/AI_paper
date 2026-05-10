@@ -5,6 +5,7 @@
 
 import os
 import re
+import json
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -20,23 +21,35 @@ from modules.aux_tools import AuxTools
 from modules.app_metadata import MODULE_PAPER_WRITE
 from modules.paper_writer import PaperWriter
 from modules.table_blocks import (
+    TABLE_ALIGN_CENTER,
+    TABLE_ALIGN_LEFT,
+    TABLE_ALIGN_RIGHT,
     TABLE_STYLE_GRID,
     TABLE_STYLE_THREE_LINE,
     blocks_from_plain_text,
     blocks_to_plain_text,
     clear_table_cells,
+    calculate_table_column_widths,
     deep_copy_blocks,
+    delete_table_alignment_columns,
+    delete_table_alignment_rows,
     delete_table_columns_with_merges,
     delete_table_rows_with_merges,
     expand_selection_range_for_merges,
+    insert_table_alignment_columns,
+    insert_table_alignment_rows,
     insert_table_columns_with_merges,
     insert_table_rows_with_merges,
     merge_table_cells,
     new_paragraph_block,
     new_table_block,
+    normalize_table_alignments,
+    normalize_table_alignment,
     normalize_merged_cells,
     normalize_table_style,
+    normalize_table_pixel_sizes,
     sanitize_blocks,
+    set_table_cell_alignment,
     unmerge_table_cells,
 )
 from pages.home_support import ensure_model_configured
@@ -62,14 +75,32 @@ from modules.workspace_state import WorkspaceStateMixin
 
 
 class _TableBlockWidget:
-    CELL_WIDTH = 14
+    CELL_WIDTH = 18
+    CELL_MIN_PIXEL_WIDTH = 96
+    CELL_MAX_PIXEL_WIDTH = 360
+    CELL_PADDING_X = 18
+    CELL_TEXT_PAD_X = 4
+    CELL_TEXT_RIGHT_MARGIN = 24
+    CELL_COLUMN_SAFETY_PADDING = 24
+    CELL_READABLE_MAX_PIXEL_WIDTH = 148
+    CELL_GRID_PAD_X = 1
+    CELL_GRID_IPAD_X = 1
+    SELECTOR_PIXEL_WIDTH = 36
+    TABLE_SHELL_PAD_X = 6
+    TABLE_EDITOR_RIGHT_GAP = 48
+    TABLE_GRID_RIGHT_INSET = 18
+    CELL_MIN_HEIGHT = 2
+    ROW_MIN_PIXEL_HEIGHT = 28
+    RESIZE_HIT_MARGIN = 6
     ROW_SELECTOR_WIDTH = 3
     COL_SELECTOR_HEIGHT = 1
 
-    def __init__(self, parent, block, on_change=None, on_delete=None):
+    def __init__(self, parent, block, on_change=None, on_delete=None, on_activate=None, viewport_parent=None):
         self.parent = parent
+        self.viewport_parent = viewport_parent or parent
         self.on_change = on_change or (lambda: None)
         self.on_delete = on_delete or (lambda _editor: None)
+        self.on_activate = on_activate or (lambda _editor: None)
         self.block_id = str((block or {}).get('table_id', '') or os.urandom(6).hex())
         self.has_header = bool((block or {}).get('has_header', True))
         self.caption_var = tk.StringVar(value=str((block or {}).get('caption', '') or ''))
@@ -80,6 +111,21 @@ class _TableBlockWidget:
             len(self.rows[0]) if self.rows else 1,
         )
         self.table_style = normalize_table_style((block or {}).get('table_style', TABLE_STYLE_GRID))
+        self.cell_alignments = normalize_table_alignments(
+            (block or {}).get('cell_alignments', []),
+            len(self.rows),
+            len(self.rows[0]) if self.rows else 1,
+        )
+        self.manual_column_widths = normalize_table_pixel_sizes(
+            (block or {}).get('column_widths', []),
+            len(self.rows[0]) if self.rows else 1,
+            min_value=self.CELL_MIN_PIXEL_WIDTH,
+        )
+        self.manual_row_heights = normalize_table_pixel_sizes(
+            (block or {}).get('row_heights', []),
+            len(self.rows),
+            min_value=self.ROW_MIN_PIXEL_HEIGHT,
+        )
         self.selection_mode = 'cell'
         self.selected_row = 0
         self.selected_col = 0
@@ -94,6 +140,17 @@ class _TableBlockWidget:
         self._floating_toolbar_root_bind = None
         self._covered_cells = {}
         self._merge_by_anchor = {}
+        self._column_widths = []
+        self._last_layout_width = 0
+        self._layout_after_id = None
+        self._parent_configure_bind = None
+        self._resize_state = None
+        self._resize_hover = None
+        self._resize_cursor_widget = None
+        self._drag_icon_window = None
+        self._drag_icon_label = None
+        self._drag_icon_image = None
+        self.window_frame = None
 
         self.frame = tk.Frame(
             parent,
@@ -105,6 +162,15 @@ class _TableBlockWidget:
 
         self._build_shell()
         self._render_grid()
+        self.frame.bind('<Configure>', self._on_layout_configure, add='+')
+        try:
+            self._parent_configure_bind = self.viewport_parent.bind('<Configure>', self._on_layout_configure, add='+')
+        except Exception:
+            self._parent_configure_bind = None
+
+    @staticmethod
+    def _normalize_table_text(value):
+        return re.sub(r'\s+', ' ', str(value or '').replace('\r', ' ').replace('\n', ' ')).strip()
 
     @staticmethod
     def _normalize_rows(rows):
@@ -114,9 +180,9 @@ class _TableBlockWidget:
             rows = []
         for row in rows:
             if isinstance(row, (list, tuple)):
-                normalized_row = [str(cell or '').replace('\r', '').replace('\n', ' ').strip() for cell in row]
+                normalized_row = [_TableBlockWidget._normalize_table_text(cell) for cell in row]
             else:
-                normalized_row = [str(row or '').strip()]
+                normalized_row = [_TableBlockWidget._normalize_table_text(row)]
             max_cols = max(max_cols, len(normalized_row))
             normalized.append(normalized_row)
         if not normalized:
@@ -154,9 +220,21 @@ class _TableBlockWidget:
 
         self.grid_shell = tk.Frame(self.frame, bg=COLORS['surface_alt'])
         self.grid_shell.pack(fill=tk.X, padx=6, pady=(0, 6))
+        try:
+            self.grid_shell.grid_propagate(False)
+        except tk.TclError:
+            pass
 
     def _normalize_cell_text(self, value):
-        return str(value or '').replace('\r', '').replace('\n', ' ').strip()
+        return self._normalize_table_text(value)
+
+    def _cell_text(self, widget):
+        try:
+            if isinstance(widget, tk.Text):
+                return widget.get('1.0', 'end-1c')
+            return widget.get()
+        except tk.TclError:
+            return ''
 
     def _sync_rows_from_widgets(self):
         if not hasattr(self, '_cell_widgets'):
@@ -165,7 +243,7 @@ class _TableBlockWidget:
             for col_idx, widget in enumerate(row_widgets):
                 if widget is None or not widget.winfo_exists():
                     continue
-                self.rows[row_idx][col_idx] = self._normalize_cell_text(widget.get())
+                self.rows[row_idx][col_idx] = self._normalize_cell_text(self._cell_text(widget))
 
     def _row_count(self):
         return len(self.rows)
@@ -180,8 +258,16 @@ class _TableBlockWidget:
             self._col_count(),
         )
 
+    def _normalize_current_alignments(self):
+        self.cell_alignments = normalize_table_alignments(
+            self.cell_alignments,
+            self._row_count(),
+            self._col_count(),
+        )
+
     def _build_merge_maps(self):
         self._normalize_current_merges()
+        self._normalize_current_alignments()
         covered = {}
         anchors = {}
         for cell in self.merged_cells:
@@ -228,6 +314,7 @@ class _TableBlockWidget:
         )
 
     def _set_selected_cell_range(self, anchor, target):
+        self.on_activate(self)
         if not self.rows:
             return
         anchor = (
@@ -314,6 +401,7 @@ class _TableBlockWidget:
         return max(1, end - start + 1)
 
     def _set_selected_cell(self, row_idx, col_idx):
+        self.on_activate(self)
         if not self.rows:
             self.selected_row = 0
             self.selected_col = 0
@@ -324,6 +412,7 @@ class _TableBlockWidget:
         self._destroy_floating_toolbar()
 
     def _set_selected_row(self, row_idx, end_idx=None, show_toolbar=True):
+        self.on_activate(self)
         self.selection_mode = 'row'
         start, end = self._normalize_range(row_idx, row_idx if end_idx is None else end_idx, self._row_count())
         self.selected_row_range = (start, end)
@@ -334,6 +423,7 @@ class _TableBlockWidget:
             self._show_floating_toolbar()
 
     def _set_selected_column(self, col_idx, end_idx=None, show_toolbar=True):
+        self.on_activate(self)
         self.selection_mode = 'column'
         start, end = self._normalize_range(col_idx, col_idx if end_idx is None else end_idx, self._col_count())
         self.selected_col_range = (start, end)
@@ -344,6 +434,7 @@ class _TableBlockWidget:
             self._show_floating_toolbar()
 
     def _set_selected_table(self, show_toolbar=True):
+        self.on_activate(self)
         self.selection_mode = 'table'
         self.selected_row_range = (0, max(self._row_count() - 1, 0))
         self.selected_col_range = (0, max(self._col_count() - 1, 0))
@@ -386,6 +477,538 @@ class _TableBlockWidget:
             and selected_col_start <= col_end
         )
 
+    def _cell_alignment(self, row_idx, col_idx):
+        try:
+            return normalize_table_alignment(self.cell_alignments[row_idx][col_idx])
+        except Exception:
+            return TABLE_ALIGN_LEFT
+
+    def _cell_justify(self, row_idx, col_idx):
+        alignment = self._cell_alignment(row_idx, col_idx)
+        if alignment == TABLE_ALIGN_CENTER:
+            return tk.CENTER
+        if alignment == TABLE_ALIGN_RIGHT:
+            return tk.RIGHT
+        return tk.LEFT
+
+    def _text_font(self):
+        try:
+            return tkfont.Font(root=self.frame, font=FONTS['small'])
+        except Exception:
+            return tkfont.Font(font=FONTS['small'])
+
+    def _font_metrics(self):
+        font = self._text_font()
+        line_height = max(12, int(font.metrics('linespace') or 16))
+        char_width = max(1, int(font.measure('M') or 8))
+        return font, line_height, char_width
+
+    def _load_drag_icon_image(self):
+        if self._drag_icon_image is not None:
+            return self._drag_icon_image
+        try:
+            self._drag_icon_image = load_image('png/Drag.png', max_size=(24, 24))
+        except Exception:
+            self._drag_icon_image = None
+        return self._drag_icon_image
+
+    def _show_drag_icon(self, event):
+        image = self._load_drag_icon_image()
+        if image is None:
+            return
+        if self._drag_icon_window is None or not self._drag_icon_window.winfo_exists():
+            try:
+                window = tk.Toplevel(self.frame)
+                window.overrideredirect(True)
+                window.attributes('-topmost', True)
+                label = tk.Label(window, image=image, bd=0, bg=COLORS['surface_alt'])
+                label.pack()
+                self._drag_icon_window = window
+                self._drag_icon_label = label
+            except Exception:
+                self._drag_icon_window = None
+                return
+        try:
+            self._drag_icon_window.geometry(f'+{int(event.x_root) + 10}+{int(event.y_root) + 10}')
+            self._drag_icon_window.deiconify()
+            self._drag_icon_window.lift()
+        except Exception:
+            pass
+
+    def _hide_drag_icon(self):
+        window = getattr(self, '_drag_icon_window', None)
+        if window is not None and window.winfo_exists():
+            try:
+                window.withdraw()
+            except tk.TclError:
+                pass
+
+    def _destroy_drag_icon(self):
+        window = getattr(self, '_drag_icon_window', None)
+        if window is not None and window.winfo_exists():
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self._drag_icon_window = None
+        self._drag_icon_label = None
+
+    def _set_resize_cursor(self, widget, cursor):
+        previous = getattr(self, '_resize_cursor_widget', None)
+        if previous is not None and previous is not widget and previous.winfo_exists():
+            self._restore_resize_cursor(previous)
+        self._resize_cursor_widget = widget
+        try:
+            if not hasattr(widget, '_table_default_cursor'):
+                widget._table_default_cursor = widget.cget('cursor')
+            widget.configure(cursor=cursor)
+        except tk.TclError:
+            pass
+
+    def _restore_resize_cursor(self, widget=None):
+        target = widget or getattr(self, '_resize_cursor_widget', None)
+        if target is not None and target.winfo_exists():
+            try:
+                target.configure(cursor=getattr(target, '_table_default_cursor', ''))
+            except tk.TclError:
+                pass
+        if widget is None or widget is self._resize_cursor_widget:
+            self._resize_cursor_widget = None
+
+    def _clear_resize_hover(self, widget=None):
+        if self._resize_state:
+            return
+        self._resize_hover = None
+        self._restore_resize_cursor(widget)
+        self._hide_drag_icon()
+
+    def _available_table_width(self):
+        return max(
+            self.CELL_MIN_PIXEL_WIDTH,
+            self._max_table_frame_width()
+            - self.SELECTOR_PIXEL_WIDTH
+            - self.TABLE_GRID_RIGHT_INSET
+            - self.TABLE_SHELL_PAD_X * 2
+            - self._table_border_width(),
+        )
+
+    def _text_widget_inset(self):
+        inset = 0
+        for option in ('padx', 'borderwidth', 'highlightthickness'):
+            try:
+                inset += int(float(self.viewport_parent.cget(option) or 0))
+            except Exception:
+                pass
+        return inset
+
+    def _table_border_width(self):
+        try:
+            return int(float(self.frame.cget('highlightthickness') or 0)) * 2
+        except Exception:
+            return 0
+
+    def _max_table_window_width(self):
+        try:
+            width = int(self.viewport_parent.winfo_width() or 0)
+        except Exception:
+            width = 0
+        if width <= 1:
+            try:
+                width = int(self.frame.winfo_width() or self.viewport_parent.winfo_reqwidth() or 0)
+            except Exception:
+                width = 0
+        width = width or 720
+        return max(self.CELL_MIN_PIXEL_WIDTH, width - self._text_widget_inset() * 2)
+
+    def _max_table_frame_width(self):
+        return max(
+            self.CELL_MIN_PIXEL_WIDTH,
+            self._max_table_window_width() - self.TABLE_EDITOR_RIGHT_GAP,
+        )
+
+    def _table_frame_width_for_columns(self, column_widths):
+        content_width = sum(int(width or 0) for width in (column_widths or []))
+        return min(
+            self._max_table_frame_width(),
+            self.SELECTOR_PIXEL_WIDTH
+            + content_width
+            + self.TABLE_GRID_RIGHT_INSET
+            + self.TABLE_SHELL_PAD_X * 2
+            + self._table_border_width(),
+        )
+
+    def _grid_shell_width_for_columns(self, column_widths):
+        content_width = sum(int(width or 0) for width in (column_widths or []))
+        return max(1, self.SELECTOR_PIXEL_WIDTH + content_width + self.TABLE_GRID_RIGHT_INSET)
+
+    def _sync_grid_shell_size(self, column_widths):
+        grid_width = self._grid_shell_width_for_columns(column_widths or self._column_widths)
+        try:
+            self.grid_shell.grid_propagate(True)
+            self.grid_shell.update_idletasks()
+            grid_height = max(1, int(self.grid_shell.winfo_reqheight() or self.grid_shell.winfo_height() or 1))
+            self.grid_shell.configure(width=grid_width, height=grid_height)
+            self.grid_shell.grid_propagate(False)
+        except tk.TclError:
+            pass
+
+    def _sync_window_frame_size(self, column_widths=None):
+        window_frame = getattr(self, 'window_frame', None)
+        if window_frame is None or not window_frame.winfo_exists():
+            return
+        table_width = self._table_frame_width_for_columns(column_widths or self._column_widths)
+        try:
+            self._sync_grid_shell_size(column_widths or self._column_widths)
+            self.frame.pack_propagate(True)
+            self.frame.update_idletasks()
+        except Exception:
+            pass
+        height = max(1, int(self.frame.winfo_reqheight() or self.frame.winfo_height() or 1))
+        try:
+            self.frame.configure(width=table_width, height=height)
+            self.frame.pack_propagate(False)
+            window_frame.pack_propagate(False)
+            window_frame.configure(
+                width=table_width + self.TABLE_EDITOR_RIGHT_GAP,
+                height=height,
+            )
+        except tk.TclError:
+            pass
+
+    def _measure_cell_text_widths(self):
+        body_font = self._text_font()
+        try:
+            header_font = tkfont.Font(root=self.frame, font=FONTS['body_bold'])
+        except Exception:
+            header_font = body_font
+        widths = []
+        for row_idx, row in enumerate(self.rows):
+            font = header_font if self.has_header and row_idx == 0 else body_font
+            row_widths = []
+            for cell in row:
+                parts = re.split(r'[\s，。；：、,.!?;:()\[\]{}<>《》]+', str(cell or ''))
+                candidates = [str(cell or '')] + [part for part in parts if part]
+                measured = max((font.measure(candidate) for candidate in candidates), default=0)
+                row_widths.append(measured)
+            widths.append(row_widths)
+        return widths
+
+    def _column_readable_min_widths(self, cell_text_widths):
+        col_count = self._col_count()
+        floors = [self.CELL_MIN_PIXEL_WIDTH for _col in range(col_count)]
+        if not isinstance(cell_text_widths, list):
+            return floors
+        extra_width = (
+            self.CELL_PADDING_X * 2
+            + self.CELL_TEXT_RIGHT_MARGIN
+            + self.CELL_COLUMN_SAFETY_PADDING
+        )
+        for row in cell_text_widths:
+            if not isinstance(row, (list, tuple)):
+                continue
+            for col_idx, measured in enumerate(row[:col_count]):
+                try:
+                    target = int(measured or 0) + extra_width
+                except Exception:
+                    target = extra_width
+                floors[col_idx] = max(
+                    floors[col_idx],
+                    min(self.CELL_READABLE_MAX_PIXEL_WIDTH, target),
+                )
+        return floors
+
+    def _apply_column_readable_floors(self, widths, readable_floors, available_width):
+        if not widths:
+            return widths
+        available = max(1, int(available_width or 1))
+        adjusted = [
+            max(int(width or 0), int(readable_floors[idx] if idx < len(readable_floors) else self.CELL_MIN_PIXEL_WIDTH))
+            for idx, width in enumerate(widths)
+        ]
+        overflow = sum(adjusted) - available
+        while overflow > 0:
+            flexible = [
+                idx for idx, width in enumerate(adjusted)
+                if width > self.CELL_MIN_PIXEL_WIDTH
+            ]
+            if not flexible:
+                break
+            share = max(1, (overflow + len(flexible) - 1) // len(flexible))
+            changed = 0
+            for idx in flexible:
+                reduction = min(share, adjusted[idx] - self.CELL_MIN_PIXEL_WIDTH, overflow - changed)
+                if reduction <= 0:
+                    continue
+                adjusted[idx] -= reduction
+                changed += reduction
+                if changed >= overflow:
+                    break
+            if changed <= 0:
+                break
+            overflow -= changed
+        return adjusted
+
+    def _normalize_manual_column_widths(self):
+        self.manual_column_widths = normalize_table_pixel_sizes(
+            self.manual_column_widths,
+            self._col_count(),
+            min_value=self.CELL_MIN_PIXEL_WIDTH,
+        )
+        return self.manual_column_widths
+
+    def _normalize_manual_row_heights(self):
+        self.manual_row_heights = normalize_table_pixel_sizes(
+            self.manual_row_heights,
+            self._row_count(),
+            min_value=self.ROW_MIN_PIXEL_HEIGHT,
+        )
+        return self.manual_row_heights
+
+    def _fit_widths_to_available(self, widths, available_width):
+        if not widths:
+            return widths
+        available = max(1, int(available_width or 1))
+        fitted = [max(self.CELL_MIN_PIXEL_WIDTH, int(width or self.CELL_MIN_PIXEL_WIDTH)) for width in widths]
+        overflow = sum(fitted) - available
+        while overflow > 0:
+            flexible = [idx for idx, width in enumerate(fitted) if width > self.CELL_MIN_PIXEL_WIDTH]
+            if not flexible:
+                break
+            share = max(1, (overflow + len(flexible) - 1) // len(flexible))
+            changed = 0
+            for idx in flexible:
+                reduction = min(share, fitted[idx] - self.CELL_MIN_PIXEL_WIDTH, overflow - changed)
+                if reduction <= 0:
+                    continue
+                fitted[idx] -= reduction
+                changed += reduction
+                if changed >= overflow:
+                    break
+            if changed <= 0:
+                break
+            overflow -= changed
+        return fitted
+
+    def _expand_widths_to_available(self, widths, available_width):
+        fitted = self._fit_widths_to_available(widths, available_width)
+        if not fitted:
+            return fitted
+        available = max(sum(fitted), int(available_width or 0))
+        extra = available - sum(fitted)
+        if extra <= 0:
+            return fitted
+        weights = [max(1, width) for width in fitted]
+        weight_total = sum(weights)
+        additions = [int(extra * weight / weight_total) for weight in weights]
+        remainder = extra - sum(additions)
+        for idx in range(remainder):
+            additions[idx % len(additions)] += 1
+        return [width + additions[idx] for idx, width in enumerate(fitted)]
+
+    def _calculate_column_widths(self):
+        available_width = self._available_table_width()
+        measurements = self._measure_cell_text_widths()
+        widths = calculate_table_column_widths(
+            self.rows,
+            available_width,
+            cell_text_widths=measurements,
+            merged_cells=self.merged_cells,
+            min_width=self.CELL_MIN_PIXEL_WIDTH,
+            max_width=self.CELL_MAX_PIXEL_WIDTH,
+            cell_padding=self.CELL_PADDING_X * 2 + self.CELL_TEXT_RIGHT_MARGIN,
+        )
+        widths = self._apply_column_readable_floors(
+            widths,
+            self._column_readable_min_widths(measurements),
+            available_width,
+        )
+        manual_widths = self._normalize_manual_column_widths()
+        if manual_widths:
+            widths = self._fit_widths_to_available(manual_widths, available_width)
+        self._column_widths = widths
+        self._last_layout_width = available_width
+        return widths
+
+    def _span_pixel_width(self, col_idx, colspan=1):
+        widths = self._column_widths or [self.CELL_MIN_PIXEL_WIDTH] * self._col_count()
+        start = max(0, int(col_idx))
+        end = min(len(widths), start + max(1, int(colspan or 1)))
+        if start >= end:
+            return self.CELL_MIN_PIXEL_WIDTH
+        return max(1, sum(widths[start:end]))
+
+    def _width_to_text_chars(self, pixel_width):
+        _font, _line_height, char_width = self._font_metrics()
+        usable_width = max(char_width, self._cell_text_usable_width(pixel_width))
+        return max(1, int(usable_width // char_width))
+
+    def _cell_text_usable_width(self, pixel_width):
+        reserved = (
+            self.CELL_TEXT_PAD_X * 2
+            + self.CELL_TEXT_RIGHT_MARGIN
+            + self.CELL_GRID_PAD_X * 2
+            + self.CELL_GRID_IPAD_X * 2
+            + 4
+        )
+        return max(12, int(pixel_width) - reserved)
+
+    def _wrapped_line_count(self, text, pixel_width):
+        font, _line_height, _char_width = self._font_metrics()
+        limit = self._cell_text_usable_width(pixel_width)
+        total = 0
+        for paragraph in str(text or '').splitlines() or ['']:
+            if not paragraph:
+                total += 1
+                continue
+            line_width = 0
+            line_count = 1
+            for token in re.findall(r'\S+\s*|\s+', paragraph):
+                token_width = max(1, font.measure(token))
+                if line_width > 0 and line_width + token_width > limit:
+                    line_count += 1
+                    line_width = 0
+                if token_width <= limit:
+                    line_width += token_width
+                    continue
+                for char in token:
+                    char_width = max(1, font.measure(char))
+                    if line_width > 0 and line_width + char_width > limit:
+                        line_count += 1
+                        line_width = 0
+                    line_width += char_width
+            total += line_count
+        return max(1, total)
+
+    def _estimate_cell_height(self, text, colspan=1, pixel_width=None):
+        value = str(text or '')
+        if pixel_width is None:
+            pixel_width = self.CELL_MIN_PIXEL_WIDTH * max(1, int(colspan or 1))
+        lines = self._wrapped_line_count(value, pixel_width)
+        return max(self.CELL_MIN_HEIGHT, lines)
+
+    def _cell_pixel_height(self, text, colspan=1, pixel_width=None, row_idx=None, rowspan=1):
+        _font, line_height, _char_width = self._font_metrics()
+        lines = self._estimate_cell_height(text, colspan=colspan, pixel_width=pixel_width)
+        auto_height = max(self.ROW_MIN_PIXEL_HEIGHT, lines * line_height + 12)
+        manual_heights = self._normalize_manual_row_heights()
+        if row_idx is None or not manual_heights:
+            return auto_height
+        start = max(0, int(row_idx))
+        end = min(len(manual_heights), start + max(1, int(rowspan or 1)))
+        if start >= end:
+            return auto_height
+        return max(auto_height, sum(manual_heights[start:end]))
+
+    def _cell_container_width(self, col_idx, colspan=1, three_line=None):
+        pixel_width = self._span_pixel_width(col_idx, colspan)
+        if three_line is None:
+            three_line = self.table_style == TABLE_STYLE_THREE_LINE
+        outer_pad = 0 if three_line else self.CELL_GRID_PAD_X
+        return max(1, int(pixel_width) - outer_pad * 2)
+
+    def _configure_cell_dimensions(self, widget, row_idx, col_idx, text, colspan=1):
+        pixel_width = self._span_pixel_width(col_idx, colspan)
+        widget.configure(
+            width=1,
+            height=1,
+            wrap=tk.CHAR,
+        )
+        container = getattr(widget, '_cell_container', None)
+        if container is not None and container.winfo_exists():
+            container.configure(
+                width=self._cell_container_width(col_idx, colspan),
+                height=self._cell_pixel_height(text, colspan=colspan, pixel_width=pixel_width, row_idx=row_idx),
+            )
+
+    def _display_line_count(self, widget, fallback_text='', fallback_width=None):
+        try:
+            widget.update_idletasks()
+            count = widget.count('1.0', 'end-1c', 'displaylines')
+            if count:
+                return max(self.CELL_MIN_HEIGHT, int(count[0]) + 1)
+        except Exception:
+            pass
+        width = fallback_width
+        if width is None:
+            try:
+                width = max(1, int(widget.winfo_width() or 0))
+            except Exception:
+                width = self.CELL_MIN_PIXEL_WIDTH
+        return self._estimate_cell_height(fallback_text, pixel_width=width)
+
+    def _fit_cell_heights_to_content(self):
+        if not self.frame.winfo_exists():
+            return
+        changed = False
+        for row_idx, row_widgets in enumerate(getattr(self, '_cell_widgets', [])):
+            for col_idx, widget in enumerate(row_widgets):
+                if widget is None or not widget.winfo_exists() or (row_idx, col_idx) in self._covered_cells:
+                    continue
+                merged = self._merge_by_anchor.get((row_idx, col_idx))
+                colspan = int(merged.get('colspan', 1)) if merged else 1
+                text = self._cell_text(widget)
+                fallback_width = self._span_pixel_width(col_idx, colspan)
+                height = self._display_line_count(widget, text, fallback_width)
+                _font, line_height, _char_width = self._font_metrics()
+                pixel_height = max(24, height * line_height + 12)
+                manual_heights = self._normalize_manual_row_heights()
+                if manual_heights and row_idx < len(manual_heights):
+                    pixel_height = max(pixel_height, manual_heights[row_idx])
+                try:
+                    container = getattr(widget, '_cell_container', None)
+                    current = int(container.cget('height') or 0) if container is not None else 0
+                except Exception:
+                    current = 0
+                if current != pixel_height:
+                    try:
+                        if container is not None and container.winfo_exists():
+                            container.configure(height=pixel_height)
+                    except tk.TclError:
+                        pass
+                    changed = True
+        if changed:
+            self._sync_window_frame_size(self._column_widths)
+
+    def _on_layout_configure(self, event=None):
+        widget = getattr(event, 'widget', None)
+        if widget not in (self.frame, self.parent, self.viewport_parent):
+            return
+        current_width = self._available_table_width()
+        if abs(current_width - self._last_layout_width) < 8:
+            return
+        self._schedule_layout_refresh()
+
+    def _schedule_layout_refresh(self, delay=120):
+        if self._layout_after_id is not None:
+            try:
+                self.frame.after_cancel(self._layout_after_id)
+            except Exception:
+                pass
+        self._layout_after_id = self.frame.after(delay, self._refresh_existing_layout)
+
+    def _refresh_existing_layout(self):
+        self._layout_after_id = None
+        if not self.frame.winfo_exists() or not getattr(self, '_cell_widgets', None):
+            return
+        self._sync_rows_from_widgets()
+        self._build_merge_maps()
+        column_widths = self._calculate_column_widths()
+        self.grid_shell.grid_columnconfigure(0, weight=0, minsize=self.SELECTOR_PIXEL_WIDTH)
+        for col_idx in range(self._col_count()):
+            width = column_widths[col_idx] if col_idx < len(column_widths) else self.CELL_MIN_PIXEL_WIDTH
+            self.grid_shell.grid_columnconfigure(col_idx + 1, weight=0, minsize=width)
+        self.grid_shell.grid_columnconfigure(self._col_count() + 1, weight=0, minsize=self.TABLE_GRID_RIGHT_INSET)
+        for row_idx, row_widgets in enumerate(getattr(self, '_cell_widgets', [])):
+            for col_idx, widget in enumerate(row_widgets):
+                if widget is None or not widget.winfo_exists() or (row_idx, col_idx) in self._covered_cells:
+                    continue
+                merged = self._merge_by_anchor.get((row_idx, col_idx))
+                colspan = int(merged.get('colspan', 1)) if merged else 1
+                text = self.rows[row_idx][col_idx] if row_idx < len(self.rows) and col_idx < len(self.rows[row_idx]) else ''
+                self._configure_cell_dimensions(widget, row_idx, col_idx, text, colspan)
+        self._sync_window_frame_size(column_widths)
+        self.frame.after_idle(self._fit_cell_heights_to_content)
+
     def _refresh_selection_style(self):
         for row_idx, row_widgets in enumerate(getattr(self, '_cell_widgets', [])):
             for col_idx, widget in enumerate(row_widgets):
@@ -403,7 +1026,7 @@ class _TableBlockWidget:
                     bg = COLORS['surface_alt']
                 else:
                     bg = COLORS['input_bg']
-                widget.configure(bg=bg)
+                widget.configure(bg=bg, highlightbackground=COLORS['accent'] if selected else COLORS['input_border'])
 
         for row_idx, selector in enumerate(getattr(self, '_row_selectors', [])):
             selected = self.selection_mode in {'row', 'table'} and self.selected_row_range[0] <= row_idx <= self.selected_row_range[1]
@@ -435,6 +1058,7 @@ class _TableBlockWidget:
             child.destroy()
 
         self._cell_widgets = []
+        self._cell_containers = []
         self._row_selectors = []
         self._col_selectors = []
         self._covered_cells = {}
@@ -447,6 +1071,7 @@ class _TableBlockWidget:
             row_count = len(self.rows)
             col_count = len(self.rows[0])
         self._build_merge_maps()
+        column_widths = self._calculate_column_widths()
         three_line = self.table_style == TABLE_STYLE_THREE_LINE
 
         self._table_selector = tk.Label(
@@ -484,6 +1109,8 @@ class _TableBlockWidget:
             selector.grid(row=0, column=col_idx + 1, sticky='nsew', padx=1, pady=1)
             selector.bind('<Enter>', lambda _event, c=col_idx: self._set_hover('column', c))
             selector.bind('<Leave>', lambda _event, c=col_idx: self._clear_hover('column', c))
+            selector.bind('<Motion>', lambda event, c=col_idx: self._on_column_selector_motion(c, event))
+            selector.bind('<Leave>', lambda event, c=col_idx: (self._clear_hover('column', c), self._clear_resize_hover(getattr(event, 'widget', None))))
             selector.bind('<Button-1>', lambda event, c=col_idx: self._on_column_selector_press(c, event))
             selector.bind('<B1-Motion>', self._on_column_selector_drag)
             selector.bind('<ButtonRelease-1>', self._on_selector_release)
@@ -514,6 +1141,8 @@ class _TableBlockWidget:
             selector.grid(row=self._data_grid_row(row_idx), column=0, sticky='nsew', padx=1, pady=1)
             selector.bind('<Enter>', lambda _event, r=row_idx: self._set_hover('row', r))
             selector.bind('<Leave>', lambda _event, r=row_idx: self._clear_hover('row', r))
+            selector.bind('<Motion>', lambda event, r=row_idx: self._on_row_selector_motion(r, event))
+            selector.bind('<Leave>', lambda event, r=row_idx: (self._clear_hover('row', r), self._clear_resize_hover(getattr(event, 'widget', None))))
             selector.bind('<Button-1>', lambda event, r=row_idx: self._on_row_selector_press(r, event))
             selector.bind('<B1-Motion>', self._on_row_selector_drag)
             selector.bind('<ButtonRelease-1>', self._on_selector_release)
@@ -521,6 +1150,7 @@ class _TableBlockWidget:
             self._row_selectors.append(selector)
 
             row_widgets = [None] * col_count
+            row_containers = [None] * col_count
             for col_idx in range(col_count):
                 if (row_idx, col_idx) in self._covered_cells:
                     continue
@@ -528,29 +1158,57 @@ class _TableBlockWidget:
                 rowspan = int(merged.get('rowspan', 1)) if merged else 1
                 colspan = int(merged.get('colspan', 1)) if merged else 1
                 cell_value = row[col_idx] if col_idx < len(row) else ''
-                cell = tk.Entry(
+                pixel_width = self._span_pixel_width(col_idx, colspan)
+                container = tk.Frame(
                     self.grid_shell,
+                    width=self._cell_container_width(col_idx, colspan, three_line=three_line),
+                    height=self._cell_pixel_height(
+                        cell_value,
+                        colspan=colspan,
+                        pixel_width=pixel_width,
+                        row_idx=row_idx,
+                        rowspan=rowspan,
+                    ),
+                    bg=COLORS['surface_alt'] if self.has_header and row_idx == 0 else COLORS['input_bg'],
+                    highlightthickness=0,
+                    bd=0,
+                )
+                container.grid(
+                    row=self._data_grid_row(row_idx),
+                    column=col_idx + 1,
+                    rowspan=self._data_rowspan(rowspan),
+                    columnspan=colspan,
+                    sticky='nsew',
+                    padx=0 if three_line else self.CELL_GRID_PAD_X,
+                    pady=0 if three_line else 1,
+                )
+                container.pack_propagate(False)
+                cell = tk.Text(
+                    container,
                     font=FONTS['small'],
-                    width=self.CELL_WIDTH,
+                    width=1,
+                    height=1,
+                    wrap=tk.CHAR,
                     bg=COLORS['surface_alt'] if self.has_header and row_idx == 0 else COLORS['input_bg'],
                     fg=COLORS['text_main'],
                     relief=tk.FLAT,
                     highlightthickness=0 if three_line else 1,
                     highlightbackground=COLORS['surface_alt'] if three_line else COLORS['input_border'],
                     insertbackground=COLORS['text_main'],
+                    padx=4,
+                    pady=3,
+                    tabs=(self._font_metrics()[2] * 4,),
+                    undo=True,
                 )
-                cell.grid(
-                    row=self._data_grid_row(row_idx),
-                    column=col_idx + 1,
-                    rowspan=self._data_rowspan(rowspan),
-                    columnspan=colspan,
-                    sticky='nsew',
-                    padx=0 if three_line else 1,
-                    pady=0 if three_line else 1,
-                    ipadx=1,
-                    ipady=2,
+                cell.tag_configure(
+                    'cell_align',
+                    justify=self._cell_justify(row_idx, col_idx),
+                    rmargin=self.CELL_TEXT_RIGHT_MARGIN,
                 )
-                cell.insert(0, cell_value)
+                cell._cell_container = container
+                cell.pack(fill=tk.BOTH, expand=True)
+                cell.insert('1.0', cell_value)
+                cell.tag_add('cell_align', '1.0', 'end')
                 if self.has_header and row_idx == 0:
                     cell.configure(font=FONTS['body_bold'])
                 cell.bind('<FocusIn>', lambda _event, r=row_idx, c=col_idx: self._on_cell_focus(r, c))
@@ -559,17 +1217,162 @@ class _TableBlockWidget:
                 cell.bind('<ButtonRelease-1>', self._on_cell_release)
                 cell.bind('<Button-3>', lambda event, r=row_idx, c=col_idx: self._on_cell_context(r, c, event))
                 cell.bind('<KeyRelease>', lambda _event: self._on_cell_changed())
+                cell.bind('<Return>', self._on_cell_return)
+                cell.bind('<Control-Return>', lambda _event: None)
                 row_widgets[col_idx] = cell
+                row_containers[col_idx] = container
             self._cell_widgets.append(row_widgets)
+            self._cell_containers.append(row_containers)
 
-        self.grid_shell.grid_columnconfigure(0, weight=0, minsize=24)
+        self.grid_shell.grid_columnconfigure(0, weight=0, minsize=self.SELECTOR_PIXEL_WIDTH)
         for col_idx in range(col_count):
-            self.grid_shell.grid_columnconfigure(col_idx + 1, weight=1, uniform='paper_table_col')
+            width = column_widths[col_idx] if col_idx < len(column_widths) else self.CELL_MIN_PIXEL_WIDTH
+            self.grid_shell.grid_columnconfigure(col_idx + 1, weight=0, minsize=width)
+        self.grid_shell.grid_columnconfigure(col_count + 1, weight=0, minsize=self.TABLE_GRID_RIGHT_INSET)
         self.grid_shell.grid_rowconfigure(0, weight=0, minsize=20)
         for row_idx in range(row_count):
             self.grid_shell.grid_rowconfigure(self._data_grid_row(row_idx), weight=1)
 
+        self._sync_window_frame_size(column_widths)
         self._refresh_selection_style()
+        self.frame.after_idle(self._fit_cell_heights_to_content)
+
+    def _column_resize_hit(self, widget, col_idx, event):
+        if self._col_count() <= 1:
+            return None
+        try:
+            x = int(event.x_root) - int(widget.winfo_rootx())
+            width = max(1, int(widget.winfo_width()))
+        except Exception:
+            return None
+        margin = self.RESIZE_HIT_MARGIN
+        if x <= margin and col_idx > 0:
+            return ('column', col_idx - 1)
+        if x >= width - margin and col_idx < self._col_count() - 1:
+            return ('column', col_idx)
+        return None
+
+    def _row_resize_hit(self, widget, row_idx, event):
+        if self._row_count() <= 1:
+            return None
+        try:
+            y = int(event.y_root) - int(widget.winfo_rooty())
+            height = max(1, int(widget.winfo_height()))
+        except Exception:
+            return None
+        margin = self.RESIZE_HIT_MARGIN
+        if y <= margin and row_idx > 0:
+            return ('row', row_idx - 1)
+        if y >= height - margin and row_idx < self._row_count() - 1:
+            return ('row', row_idx)
+        return None
+
+    def _column_selector_resize_hit(self, col_idx, event):
+        widget = getattr(event, 'widget', None)
+        return self._column_resize_hit(widget, col_idx, event) if widget is not None else None
+
+    def _row_selector_resize_hit(self, row_idx, event):
+        widget = getattr(event, 'widget', None)
+        return self._row_resize_hit(widget, row_idx, event) if widget is not None else None
+
+    def _update_resize_hover(self, event, hit):
+        widget = getattr(event, 'widget', None)
+        if widget is None:
+            return
+        if hit is None:
+            self._clear_resize_hover(widget)
+            return
+        mode, index = hit
+        self._resize_hover = hit
+        self._set_resize_cursor(widget, 'sb_h_double_arrow' if mode == 'column' else 'sb_v_double_arrow')
+        self._show_drag_icon(event)
+
+    def _on_column_selector_motion(self, col_idx, event=None):
+        if event is None:
+            return None
+        self._update_resize_hover(event, self._column_selector_resize_hit(col_idx, event))
+        return None
+
+    def _on_row_selector_motion(self, row_idx, event=None):
+        if event is None:
+            return None
+        self._update_resize_hover(event, self._row_selector_resize_hit(row_idx, event))
+        return None
+
+    def _start_resize_from_hit(self, hit, event):
+        if hit is None or event is None:
+            return False
+        mode, index = hit
+        self._sync_rows_from_widgets()
+        self._resize_state = {
+            'mode': mode,
+            'index': index,
+            'start_x': int(getattr(event, 'x_root', 0) or 0),
+            'start_y': int(getattr(event, 'y_root', 0) or 0),
+            'column_widths': list(self._column_widths or self._calculate_column_widths()),
+            'row_heights': self._current_row_pixel_heights(),
+        }
+        self._drag_select_mode = 'resize'
+        self._set_resize_cursor(getattr(event, 'widget', self.frame), 'sb_h_double_arrow' if mode == 'column' else 'sb_v_double_arrow')
+        self._show_drag_icon(event)
+        return True
+
+    def _current_row_pixel_heights(self):
+        heights = []
+        manual = self._normalize_manual_row_heights()
+        for row_idx in range(self._row_count()):
+            row_height = manual[row_idx] if manual and row_idx < len(manual) else self.ROW_MIN_PIXEL_HEIGHT
+            for container in getattr(self, '_cell_containers', [[]])[row_idx] if row_idx < len(getattr(self, '_cell_containers', [])) else []:
+                if container is not None and container.winfo_exists():
+                    try:
+                        row_height = max(row_height, int(container.winfo_height() or 0))
+                    except Exception:
+                        pass
+            heights.append(max(self.ROW_MIN_PIXEL_HEIGHT, row_height))
+        return heights
+
+    def _perform_resize_drag(self, event):
+        state = self._resize_state
+        if not state:
+            return None
+        mode = state.get('mode')
+        index = int(state.get('index', 0))
+        if mode == 'column':
+            widths = list(state.get('column_widths') or [])
+            if index < 0 or index + 1 >= len(widths):
+                return 'break'
+            delta = int(getattr(event, 'x_root', 0) or 0) - int(state.get('start_x', 0))
+            left_original = int(widths[index])
+            right_original = int(widths[index + 1])
+            min_width = self.CELL_MIN_PIXEL_WIDTH
+            delta = max(min_width - left_original, min(delta, right_original - min_width))
+            widths[index] = left_original + delta
+            widths[index + 1] = right_original - delta
+            self.manual_column_widths = widths
+            self._refresh_existing_layout()
+        elif mode == 'row':
+            heights = list(state.get('row_heights') or [])
+            if index < 0 or index >= len(heights):
+                return 'break'
+            delta = int(getattr(event, 'y_root', 0) or 0) - int(state.get('start_y', 0))
+            heights[index] = max(self.ROW_MIN_PIXEL_HEIGHT, int(heights[index]) + delta)
+            self.manual_row_heights = heights
+            self._refresh_existing_layout()
+        self._show_drag_icon(event)
+        return 'break'
+
+    def _stop_resize_drag(self, event=None):
+        if not self._resize_state:
+            return None
+        self._resize_state = None
+        self._drag_select_mode = ''
+        self._notify_change()
+        if event is not None:
+            hit = self._resize_hover
+            self._update_resize_hover(event, hit)
+        else:
+            self._clear_resize_hover()
+        return 'break'
 
     def _index_from_root_position(self, widgets, axis, root_value):
         for index, widget in enumerate(widgets):
@@ -609,18 +1412,24 @@ class _TableBlockWidget:
         return 'break'
 
     def _on_row_selector_press(self, row_idx, event=None):
+        if self._start_resize_from_hit(self._row_selector_resize_hit(row_idx, event), event):
+            return 'break'
         self._drag_select_mode = 'row'
         self._drag_anchor_index = row_idx
         self._set_selected_row(row_idx, show_toolbar=False)
         return 'break'
 
     def _on_column_selector_press(self, col_idx, event=None):
+        if self._start_resize_from_hit(self._column_selector_resize_hit(col_idx, event), event):
+            return 'break'
         self._drag_select_mode = 'column'
         self._drag_anchor_index = col_idx
         self._set_selected_column(col_idx, show_toolbar=False)
         return 'break'
 
     def _on_row_selector_drag(self, event=None):
+        if self._resize_state:
+            return self._perform_resize_drag(event)
         if self._drag_select_mode != 'row' or self._drag_anchor_index is None:
             return 'break'
         target = self._index_from_root_position(self._row_selectors, 'y', getattr(event, 'y_root', 0))
@@ -629,6 +1438,8 @@ class _TableBlockWidget:
         return 'break'
 
     def _on_column_selector_drag(self, event=None):
+        if self._resize_state:
+            return self._perform_resize_drag(event)
         if self._drag_select_mode != 'column' or self._drag_anchor_index is None:
             return 'break'
         target = self._index_from_root_position(self._col_selectors, 'x', getattr(event, 'x_root', 0))
@@ -637,6 +1448,8 @@ class _TableBlockWidget:
         return 'break'
 
     def _on_selector_release(self, event=None):
+        if self._resize_state:
+            return self._stop_resize_drag(event)
         self._drag_select_mode = ''
         self._drag_anchor_index = None
         self._cell_drag_anchor = None
@@ -660,6 +1473,7 @@ class _TableBlockWidget:
         return None
 
     def _on_cell_focus(self, row_idx, col_idx):
+        self.on_activate(self)
         if self._drag_select_mode == 'cell':
             return
         self._set_selected_cell(row_idx, col_idx)
@@ -720,6 +1534,10 @@ class _TableBlockWidget:
         )
         style_label = '切换为普通表格' if self.table_style == TABLE_STYLE_THREE_LINE else '切换为三线表'
         menu.add_command(label=style_label, command=self.toggle_three_line_table)
+        if self.selection_mode == 'table':
+            menu.add_separator()
+            menu.add_command(label='根据窗口调整表格', command=self.fit_table_to_window)
+            menu.add_command(label='根据内容调整表格', command=self.fit_table_to_content)
         menu.add_separator()
         menu.add_command(label='删除所选行', command=self.delete_row)
         menu.add_command(label='删除所选列', command=self.delete_column)
@@ -751,12 +1569,18 @@ class _TableBlockWidget:
     def _show_floating_toolbar(self):
         self._destroy_floating_toolbar()
 
-    def _apply_rows_update(self, rows, *, merged_cells=None, mode=None, row_range=None, col_range=None, show_toolbar=True):
+    def _apply_rows_update(self, rows, *, merged_cells=None, cell_alignments=None, mode=None, row_range=None, col_range=None, show_toolbar=True):
         self.rows = self._normalize_rows(rows)
         if merged_cells is not None:
             self.merged_cells = normalize_merged_cells(merged_cells, self._row_count(), self._col_count())
         else:
             self._normalize_current_merges()
+        if cell_alignments is not None:
+            self.cell_alignments = normalize_table_alignments(cell_alignments, self._row_count(), self._col_count())
+        else:
+            self._normalize_current_alignments()
+        self._normalize_manual_column_widths()
+        self._normalize_manual_row_heights()
         if mode == 'row' and row_range is not None:
             self.selection_mode = 'row'
             self.selected_row_range = self._normalize_range(row_range[0], row_range[1], self._row_count())
@@ -780,10 +1604,44 @@ class _TableBlockWidget:
 
     def _on_cell_changed(self):
         self._sync_rows_from_widgets()
+        self._schedule_layout_refresh(delay=180)
         self._notify_change()
+
+    def _on_cell_return(self, event=None):
+        widget = getattr(event, 'widget', None)
+        if isinstance(widget, tk.Text):
+            widget.insert(tk.INSERT, ' ')
+            self._on_cell_changed()
+        return 'break'
 
     def _notify_change(self):
         self.on_change()
+
+    def apply_alignment(self, alignment):
+        self._sync_rows_from_widgets()
+        row_range, col_range = self._current_content_range()
+        self.cell_alignments = set_table_cell_alignment(
+            self.cell_alignments,
+            alignment,
+            mode=self.selection_mode,
+            row_range=row_range,
+            col_range=col_range,
+            row_count=self._row_count(),
+            col_count=self._col_count(),
+        )
+        for row_idx, row_widgets in enumerate(getattr(self, '_cell_widgets', [])):
+            for col_idx, widget in enumerate(row_widgets):
+                if widget is None or not widget.winfo_exists():
+                    continue
+                if not self._is_cell_selected(row_idx, col_idx):
+                    continue
+                widget.tag_configure(
+                    'cell_align',
+                    justify=self._cell_justify(row_idx, col_idx),
+                    rmargin=self.CELL_TEXT_RIGHT_MARGIN,
+                )
+                widget.tag_add('cell_align', '1.0', 'end')
+        self._notify_change()
 
     def serialize(self):
         self._sync_rows_from_widgets()
@@ -794,6 +1652,9 @@ class _TableBlockWidget:
             has_header=self.has_header,
             merged_cells=self.merged_cells,
             table_style=self.table_style,
+            cell_alignments=self.cell_alignments,
+            column_widths=self._normalize_manual_column_widths(),
+            row_heights=self._normalize_manual_row_heights(),
         )
 
     def set_data(self, block):
@@ -810,6 +1671,21 @@ class _TableBlockWidget:
                 len(self.rows[0]) if self.rows else 1,
             )
             self.table_style = normalize_table_style(table_block.get('table_style', TABLE_STYLE_GRID))
+            self.cell_alignments = normalize_table_alignments(
+                table_block.get('cell_alignments', []),
+                len(self.rows),
+                len(self.rows[0]) if self.rows else 1,
+            )
+            self.manual_column_widths = normalize_table_pixel_sizes(
+                table_block.get('column_widths', []),
+                len(self.rows[0]) if self.rows else 1,
+                min_value=self.CELL_MIN_PIXEL_WIDTH,
+            )
+            self.manual_row_heights = normalize_table_pixel_sizes(
+                table_block.get('row_heights', []),
+                len(self.rows),
+                min_value=self.ROW_MIN_PIXEL_HEIGHT,
+            )
             self.selection_mode = 'cell'
             self.selected_row = 0
             self.selected_col = 0
@@ -817,11 +1693,45 @@ class _TableBlockWidget:
             self.selected_col_range = (0, 0)
             self._render_grid()
 
+    def _insert_manual_row_heights(self, anchor, count=1, after=True):
+        heights = self._normalize_manual_row_heights()
+        if not heights:
+            return
+        index = max(0, min(int(anchor) + (1 if after else 0), len(heights)))
+        template = heights[max(0, min(int(anchor), len(heights) - 1))] if heights else self.ROW_MIN_PIXEL_HEIGHT
+        self.manual_row_heights = heights[:index] + [template] * max(1, int(count or 1)) + heights[index:]
+
+    def _delete_manual_row_heights(self, start, end):
+        heights = self._normalize_manual_row_heights()
+        if not heights:
+            return
+        start, end = self._normalize_range(start, end, len(heights))
+        remaining = heights[:start] + heights[end + 1:]
+        self.manual_row_heights = remaining if remaining else []
+
+    def _insert_manual_column_widths(self, anchor, count=1, after=True):
+        widths = self._normalize_manual_column_widths()
+        if not widths:
+            return
+        index = max(0, min(int(anchor) + (1 if after else 0), len(widths)))
+        template = widths[max(0, min(int(anchor), len(widths) - 1))] if widths else self.CELL_MIN_PIXEL_WIDTH
+        self.manual_column_widths = widths[:index] + [template] * max(1, int(count or 1)) + widths[index:]
+
+    def _delete_manual_column_widths(self, start, end):
+        widths = self._normalize_manual_column_widths()
+        if not widths:
+            return
+        start, end = self._normalize_range(start, end, len(widths))
+        remaining = widths[:start] + widths[end + 1:]
+        self.manual_column_widths = remaining if remaining else []
+
     def insert_row(self, after=True):
         self._sync_rows_from_widgets()
         start, end = self._current_row_range()
         count = self._selected_row_count() if self.selection_mode in {'row', 'table'} else 1
         anchor = end if after else start
+        old_row_count = self._row_count()
+        old_col_count = self._col_count()
         updated, merged = insert_table_rows_with_merges(
             self.rows,
             self.merged_cells,
@@ -829,22 +1739,42 @@ class _TableBlockWidget:
             count=count,
             after=after,
         )
+        alignments = insert_table_alignment_rows(
+            self.cell_alignments,
+            anchor,
+            count=count,
+            after=after,
+            col_count=old_col_count,
+        )
         inserted_start = anchor + (1 if after else 0)
         inserted_end = inserted_start + count - 1
-        self._apply_rows_update(updated, merged_cells=merged, mode='row', row_range=(inserted_start, inserted_end))
+        self._insert_manual_row_heights(anchor, count=count, after=after)
+        self._apply_rows_update(updated, merged_cells=merged, cell_alignments=alignments, mode='row', row_range=(inserted_start, inserted_end))
 
     def delete_row(self):
         self._sync_rows_from_widgets()
         start, end = self._current_row_range()
+        old_row_count = self._row_count()
+        old_col_count = self._col_count()
         updated, merged = delete_table_rows_with_merges(self.rows, self.merged_cells, start, end)
+        alignments = delete_table_alignment_rows(
+            self.cell_alignments,
+            start,
+            end,
+            row_count=old_row_count,
+            col_count=old_col_count,
+        )
         next_row = min(start, len(updated) - 1)
-        self._apply_rows_update(updated, merged_cells=merged, mode='row', row_range=(next_row, next_row))
+        self._delete_manual_row_heights(start, end)
+        self._apply_rows_update(updated, merged_cells=merged, cell_alignments=alignments, mode='row', row_range=(next_row, next_row))
 
     def insert_column(self, after=True):
         self._sync_rows_from_widgets()
         start, end = self._current_col_range()
         count = self._selected_col_count() if self.selection_mode in {'column', 'table'} else 1
         anchor = end if after else start
+        old_row_count = self._row_count()
+        old_col_count = self._col_count()
         updated, merged = insert_table_columns_with_merges(
             self.rows,
             self.merged_cells,
@@ -852,16 +1782,35 @@ class _TableBlockWidget:
             count=count,
             after=after,
         )
+        alignments = insert_table_alignment_columns(
+            self.cell_alignments,
+            anchor,
+            count=count,
+            after=after,
+            row_count=old_row_count,
+            col_count=old_col_count,
+        )
         inserted_start = anchor + (1 if after else 0)
         inserted_end = inserted_start + count - 1
-        self._apply_rows_update(updated, merged_cells=merged, mode='column', col_range=(inserted_start, inserted_end))
+        self._insert_manual_column_widths(anchor, count=count, after=after)
+        self._apply_rows_update(updated, merged_cells=merged, cell_alignments=alignments, mode='column', col_range=(inserted_start, inserted_end))
 
     def delete_column(self):
         self._sync_rows_from_widgets()
         start, end = self._current_col_range()
+        old_row_count = self._row_count()
+        old_col_count = self._col_count()
         updated, merged = delete_table_columns_with_merges(self.rows, self.merged_cells, start, end)
+        alignments = delete_table_alignment_columns(
+            self.cell_alignments,
+            start,
+            end,
+            row_count=old_row_count,
+            col_count=old_col_count,
+        )
         next_col = min(start, len(updated[0]) - 1)
-        self._apply_rows_update(updated, merged_cells=merged, mode='column', col_range=(next_col, next_col))
+        self._delete_manual_column_widths(start, end)
+        self._apply_rows_update(updated, merged_cells=merged, cell_alignments=alignments, mode='column', col_range=(next_col, next_col))
 
     def delete_selection(self):
         if self.selection_mode == 'column':
@@ -937,13 +1886,49 @@ class _TableBlockWidget:
         self._render_grid()
         self._notify_change()
 
+    def fit_table_to_window(self):
+        self._sync_rows_from_widgets()
+        self.manual_column_widths = []
+        base_widths = self._calculate_column_widths()
+        self.manual_column_widths = self._expand_widths_to_available(base_widths, self._available_table_width())
+        self.selection_mode = 'table'
+        self.selected_row_range = (0, max(self._row_count() - 1, 0))
+        self.selected_col_range = (0, max(self._col_count() - 1, 0))
+        self._render_grid()
+        self._notify_change()
+
+    def fit_table_to_content(self):
+        self._sync_rows_from_widgets()
+        self.manual_column_widths = []
+        self.selection_mode = 'table'
+        self.selected_row_range = (0, max(self._row_count() - 1, 0))
+        self.selected_col_range = (0, max(self._col_count() - 1, 0))
+        self._render_grid()
+        self._notify_change()
+
     def delete_table(self):
         self._destroy_floating_toolbar()
         self.on_delete(self)
 
     def destroy(self):
+        if self._layout_after_id is not None:
+            try:
+                self.frame.after_cancel(self._layout_after_id)
+            except Exception:
+                pass
+            self._layout_after_id = None
+        if self._parent_configure_bind:
+            try:
+                self.viewport_parent.unbind('<Configure>', self._parent_configure_bind)
+            except Exception:
+                pass
+            self._parent_configure_bind = None
         self._destroy_floating_toolbar()
-        if self.frame.winfo_exists():
+        self._destroy_drag_icon()
+        window_frame = getattr(self, 'window_frame', None)
+        if window_frame is not None and window_frame.winfo_exists():
+            window_frame.destroy()
+        elif self.frame.winfo_exists():
             self.frame.destroy()
 
 
@@ -959,6 +1944,11 @@ class PaperWritePage(WorkspaceStateMixin):
         'fmt_italic',
         'fmt_underline',
         'fmt_strike',
+    )
+    PARAGRAPH_ALIGNMENT_TAGS = (
+        'fmt_align_left',
+        'fmt_align_center',
+        'fmt_align_right',
     )
     SCRIPT_FORMAT_TAGS = (
         'fmt_superscript',
@@ -1021,6 +2011,9 @@ class PaperWritePage(WorkspaceStateMixin):
         '缩进': '缩',
         '项目符号': '•',
         '编号': '1.',
+        '居左': '左',
+        '居中': '中',
+        '居右': '右',
         '引用': '引',
         '查替': '查',
     }
@@ -1077,6 +2070,8 @@ class PaperWritePage(WorkspaceStateMixin):
     OUTLINE_INTRO_TITLES = frozenset({'引言', '绪论'})
     OUTLINE_REFERENCE_TITLES = frozenset({'参考文献', 'references', 'bibliography'})
     OUTLINE_APPENDIX_TITLES = frozenset({'附录', 'appendix'})
+    OUTLINE_IMPORT_MODE_LOCAL = 'local'
+    OUTLINE_IMPORT_MODE_AI = 'ai'
     NUMERIC_REFERENCE_STYLES = frozenset({'GB/T 7714', 'IEEE'})
     BATCH_WRITE_WARNING_SECTION_WORDS = max(1200, PaperWriter.SECTION_MAX_TOKENS * 2 // 3)
     BATCH_WRITE_WARNING_TOTAL_WORDS = PaperWriter.SECTION_MAX_TOKENS * 4
@@ -1132,6 +2127,7 @@ class PaperWritePage(WorkspaceStateMixin):
         self._editor_format_fonts = {}
         self._editor_font_render_tags = {}
         self._editor_block_widgets = []
+        self._active_table_editor = None
         self._outline_level_fonts = {}
         self._stats_layout_job = None
         self._pending_stats_width = None
@@ -1162,7 +2158,17 @@ class PaperWritePage(WorkspaceStateMixin):
         left = self._build_left_panel(body)
         right = self._build_right_panel(body)
 
-        bind_responsive_two_pane(body, left, right, breakpoint=1180, gap=8, left_minsize=260)
+        bind_responsive_two_pane(
+            body,
+            left,
+            right,
+            breakpoint=1180,
+            gap=8,
+            left_minsize=260,
+            left_weight=25,
+            right_weight=75,
+            uniform_group='paper_write_body',
+        )
 
     def _bind_workspace_state_watchers(self):
         for widget in (self.topic_entry, self.subject_entry, self.section_entry, self.edit_text):
@@ -1483,11 +2489,28 @@ class PaperWritePage(WorkspaceStateMixin):
         self._stat_labels = {}
         grid = tk.Frame(stat_inner, bg=COLORS['card_bg'])
         grid.pack(fill=tk.X, pady=(0, 8))
-        for i, (lbl, key) in enumerate(stats):
+        stat_positions = [
+            (0, 0, 2),
+            (0, 2, 2),
+            (0, 4, 2),
+            (1, 0, 3),
+            (1, 3, 3),
+        ]
+        for col_index in range(6):
+            grid.columnconfigure(col_index, weight=1, uniform='paper_stats')
+        for row_index in range(2):
+            grid.rowconfigure(row_index, weight=1)
+        for (lbl, key), (row_index, col_index, colspan) in zip(stats, stat_positions):
             col = tk.Frame(grid, bg=COLORS['surface_alt'],
                            highlightbackground=COLORS['card_border'], highlightthickness=1)
-            col.grid(row=0, column=i, padx=(0, 4), sticky='ew')
-            grid.columnconfigure(i, weight=1)
+            col.grid(
+                row=row_index,
+                column=col_index,
+                columnspan=colspan,
+                padx=(0, 4),
+                pady=(0, 4),
+                sticky='nsew',
+            )
             tk.Label(col, text=lbl, font=FONTS['tiny'] if hasattr(FONTS, 'tiny') else FONTS['small'],
                      fg=COLORS['text_muted'], bg=COLORS['surface_alt']).pack(pady=(4, 0))
             val_lbl = tk.Label(col, text='0', font=FONTS['body_bold'] if 'body_bold' in FONTS else FONTS['body'],
@@ -1688,6 +2711,7 @@ class PaperWritePage(WorkspaceStateMixin):
                 ('上标', lambda: self._toggle_inline_format_selection('fmt_superscript', exclusive_group=self.SCRIPT_FORMAT_TAGS)),
                 ('下标', lambda: self._toggle_inline_format_selection('fmt_subscript', exclusive_group=self.SCRIPT_FORMAT_TAGS)),
             ],
+            [('居左', lambda: self._apply_alignment(TABLE_ALIGN_LEFT)), ('居中', lambda: self._apply_alignment(TABLE_ALIGN_CENTER)), ('居右', lambda: self._apply_alignment(TABLE_ALIGN_RIGHT))],
             [('缩进', self._indent_selected_paragraphs), ('项目符号', self._open_bullet_menu), ('编号', self._open_numbering_dialog)],
             [('引用', self._insert_citation_template), ('查替', self._open_find_dialog)],
         ]
@@ -1766,6 +2790,7 @@ class PaperWritePage(WorkspaceStateMixin):
     def _format_tag_names(self):
         tags = list(self.STACKABLE_INLINE_FORMAT_TAGS)
         tags.extend(self.SCRIPT_FORMAT_TAGS)
+        tags.extend(self.PARAGRAPH_ALIGNMENT_TAGS)
         tags.extend(tag for _label, tag, _color in self.FOREGROUND_FORMAT_COLORS)
         tags.extend(tag for _label, tag, _color in self.BACKGROUND_FORMAT_COLORS if tag)
         return tags
@@ -1878,6 +2903,9 @@ class PaperWritePage(WorkspaceStateMixin):
         self._configure_editor_render_fonts()
         self.edit_text.tag_configure('fmt_underline', underline=1)
         self.edit_text.tag_configure('fmt_strike', overstrike=1)
+        self.edit_text.tag_configure('fmt_align_left', justify=tk.LEFT)
+        self.edit_text.tag_configure('fmt_align_center', justify=tk.CENTER)
+        self.edit_text.tag_configure('fmt_align_right', justify=tk.RIGHT)
         for _label, tag, color in self.FOREGROUND_FORMAT_COLORS:
             self.edit_text.tag_configure(tag, foreground=color)
         for _label, tag, color in self.BACKGROUND_FORMAT_COLORS:
@@ -2069,6 +3097,7 @@ class PaperWritePage(WorkspaceStateMixin):
             except Exception:
                 pass
         self._editor_block_widgets = []
+        self._active_table_editor = None
 
     def _normalize_section_blocks(self, blocks):
         return sanitize_blocks(blocks)
@@ -2177,14 +3206,27 @@ class PaperWritePage(WorkspaceStateMixin):
         return self._normalize_section_blocks(blocks)
 
     def _render_table_block(self, parent, block):
+        window_frame = tk.Frame(parent, bg=COLORS['input_bg'])
         editor = _TableBlockWidget(
-            parent,
+            window_frame,
             block,
             on_change=self._on_table_block_changed,
             on_delete=self._remove_table_block_widget,
+            on_activate=self._set_active_table_editor,
+            viewport_parent=parent,
         )
+        editor.window_frame = window_frame
+        window_frame._table_block_editor = editor
+        window_frame.pack_propagate(False)
+        editor.frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, editor.TABLE_EDITOR_RIGHT_GAP))
+        editor._sync_window_frame_size()
         self._editor_block_widgets.append(editor)
         return editor
+
+    def _set_active_table_editor(self, editor):
+        if editor is not None:
+            self._active_table_editor = editor
+            self._editor_selection_range = None
 
     def _render_blocks_to_editor(self, blocks, format_spans=None, reset_undo=False):
         self._clear_editor_block_widgets()
@@ -2199,8 +3241,8 @@ class PaperWritePage(WorkspaceStateMixin):
                     self.edit_text.insert(tk.END, block['text'])
                 continue
             if block['type'] == 'table':
-                self._render_table_block(self.edit_text, block)
-                self.edit_text.window_create(tk.END, window=self._editor_block_widgets[-1].frame)
+                editor = self._render_table_block(self.edit_text, block)
+                self.edit_text.window_create(tk.END, window=editor.window_frame)
 
         self._clear_editor_format_tags()
         self._apply_format_spans_to_editor(format_spans or [])
@@ -2368,6 +3410,7 @@ class PaperWritePage(WorkspaceStateMixin):
         self._sync_editor_state()
 
     def _on_editor_mouse_release(self, event=None):
+        self._active_table_editor = None
         self.frame.after_idle(self._capture_selection_snapshot)
 
     def _on_stats_container_configure(self, event=None):
@@ -2556,6 +3599,7 @@ class PaperWritePage(WorkspaceStateMixin):
     def _inline_format_groups(self):
         groups = [(tag,) for tag in self.STACKABLE_INLINE_FORMAT_TAGS]
         groups.extend(self._script_format_groups())
+        groups.append(tuple(self.PARAGRAPH_ALIGNMENT_TAGS))
         groups.append(tuple(self._foreground_format_tags()))
         groups.append(tuple(self._background_format_tags()))
         return groups
@@ -2623,6 +3667,43 @@ class PaperWritePage(WorkspaceStateMixin):
         self._restore_editor_selection(start, end)
         self._sync_editor_state()
         self.edit_text.focus_set()
+
+    def _selection_line_range(self, start, end):
+        line_start = self.edit_text.index(f'{start} linestart')
+        if self.edit_text.compare(end, '>', f'{end} linestart'):
+            line_end = self.edit_text.index(f'{end} lineend')
+        else:
+            line_end = self.edit_text.index(f'{start} lineend')
+        return line_start, line_end
+
+    def _apply_text_alignment(self, alignment):
+        start, end = self._selection_required()
+        if not start:
+            return False
+        tag_map = {
+            TABLE_ALIGN_LEFT: 'fmt_align_left',
+            TABLE_ALIGN_CENTER: 'fmt_align_center',
+            TABLE_ALIGN_RIGHT: 'fmt_align_right',
+        }
+        tag_name = tag_map.get(normalize_table_alignment(alignment), 'fmt_align_left')
+        line_start, line_end = self._selection_line_range(start, end)
+        self.edit_text.edit_separator()
+        self._remove_tags_from_range(self.PARAGRAPH_ALIGNMENT_TAGS, line_start, line_end)
+        self.edit_text.tag_add(tag_name, line_start, line_end)
+        self.edit_text.edit_separator()
+        self._restore_editor_selection(start, end)
+        self._sync_editor_state()
+        self.edit_text.focus_set()
+        return True
+
+    def _apply_alignment(self, alignment):
+        editor = getattr(self, '_active_table_editor', None)
+        if editor is not None and editor.frame.winfo_exists():
+            editor.apply_alignment(alignment)
+            self.set_status('已调整表格单元格对齐方式')
+            return
+        if self._apply_text_alignment(alignment):
+            self.set_status('已调整正文对齐方式')
 
     def _clear_format_painter(self, *, refresh=True):
         self._format_painter_tags = None
@@ -4436,6 +5517,12 @@ class PaperWritePage(WorkspaceStateMixin):
         self.topic_entry.insert(0, candidate['text'])
         return f'已自动识别论文标题（{source_label}）：{candidate["text"]}'
 
+    def _get_import_recognition_mode(self):
+        if not self.config or not hasattr(self.config, 'get_setting'):
+            return self.OUTLINE_IMPORT_MODE_LOCAL
+        value = str(self.config.get_setting('paper_write_import_recognition_mode', self.OUTLINE_IMPORT_MODE_LOCAL) or '').strip().lower()
+        return self.OUTLINE_IMPORT_MODE_AI if value == self.OUTLINE_IMPORT_MODE_AI else self.OUTLINE_IMPORT_MODE_LOCAL
+
     def _import_file(self):
         path = filedialog.askopenfilename(
             filetypes=[('Word文档', '*.docx')],
@@ -4443,11 +5530,21 @@ class PaperWritePage(WorkspaceStateMixin):
         )
         if not path:
             return
+        mode = self._get_import_recognition_mode()
+        if mode == self.OUTLINE_IMPORT_MODE_AI and not ensure_model_configured(self.config, self.frame, self.app_bridge):
+            return
 
         def work():
-            text = self.aux.import_docx(path)
-            parsed = self._build_outline_structure(text)
-            return {'text': text, 'parsed': parsed}
+            structured = self.aux.import_docx_blocks(path)
+            text = structured.get('text', '')
+            blocks = structured.get('blocks', [])
+            if mode == self.OUTLINE_IMPORT_MODE_AI:
+                parsed = self._build_outline_structure_with_ai(blocks)
+                mode_label = 'AI识别'
+            else:
+                parsed = self._build_outline_structure_from_blocks(blocks)
+                mode_label = '本地识别'
+            return {'text': text, 'parsed': parsed, 'mode_label': mode_label}
 
         def on_success(result):
             text = result['text']
@@ -4466,7 +5563,8 @@ class PaperWritePage(WorkspaceStateMixin):
             if self.config and hasattr(self.config, 'clear_home_last_import_failure'):
                 self.config.clear_home_last_import_failure()
                 self.config.save()
-            status_text = f'已导入: {path}，请点击左侧大纲章节查看内容'
+            mode_label = result.get('mode_label') or '本地识别'
+            status_text = f'已导入: {path}（{mode_label}），请点击左侧大纲章节查看内容'
             if title_feedback:
                 status_text = f'{status_text}；{title_feedback}'
             self.set_status(status_text)
@@ -4489,13 +5587,19 @@ class PaperWritePage(WorkspaceStateMixin):
         """从文本中解析章节标题，填充左侧大纲列表"""
         parsed = parsed if isinstance(parsed, dict) else self._build_outline_structure(text)
         self._sections = dict(parsed['sections'])
-        self._section_blocks = self._build_section_blocks_from_sections(self._sections)
+        raw_section_blocks = parsed.get('section_blocks', {})
+        self._section_blocks = self._normalize_section_blocks_map(raw_section_blocks, sections=self._sections)
+        for title, section_text in self._sections.items():
+            if title not in self._section_blocks:
+                blocks = self._blocks_from_section_text(section_text)
+                if blocks:
+                    self._section_blocks[title] = blocks
         self._section_formats = {title: [] for title in self._sections}
         self._section_order = list(parsed['order'])
         self._section_levels = dict(parsed['levels'])
         self._section_parent = dict(parsed['parents'])
         self._collapsed_sections = set()
-        self._normalize_outline_structure_state()
+        self._normalize_outline_structure_state(preserve_blocks=True)
         self._rebuild_section_children()
 
         self._sync_outline_text_from_sections()
@@ -4510,7 +5614,12 @@ class PaperWritePage(WorkspaceStateMixin):
             self._editor_section_source = ''
         self._touch_context_revision()
 
-    def _apply_normalized_outline_state(self, normalized):
+    def _section_has_structured_table_blocks(self, title, blocks_map=None):
+        source = blocks_map if isinstance(blocks_map, dict) else self._section_blocks
+        blocks = source.get(title, [])
+        return any(isinstance(block, dict) and block.get('type') == 'table' for block in blocks)
+
+    def _apply_normalized_outline_state(self, normalized, preserve_blocks=False):
         old_sections = dict(self._sections)
         old_blocks = self._copy_section_blocks_map()
         old_formats = self._copy_section_format_map() if hasattr(self, '_section_formats') else {}
@@ -4534,7 +5643,10 @@ class PaperWritePage(WorkspaceStateMixin):
             ]
             selected_blocks = []
             for old_title in source_titles:
-                if old_sections.get(old_title, None) == self._sections.get(title, None):
+                if (
+                    old_sections.get(old_title, None) == self._sections.get(title, None)
+                    or (preserve_blocks and self._section_has_structured_table_blocks(old_title, old_blocks))
+                ):
                     selected_blocks = old_blocks.get(old_title, [])
                     if selected_blocks:
                         break
@@ -4546,7 +5658,7 @@ class PaperWritePage(WorkspaceStateMixin):
                 self._section_blocks[title] = blocks
         return aliases
 
-    def _normalize_outline_structure_state(self):
+    def _normalize_outline_structure_state(self, preserve_blocks=False):
         normalized = self._normalize_outline_structure(
             {
                 'sections': self._sections,
@@ -4555,7 +5667,7 @@ class PaperWritePage(WorkspaceStateMixin):
                 'parents': self._section_parent,
             }
         )
-        return self._apply_normalized_outline_state(normalized)
+        return self._apply_normalized_outline_state(normalized, preserve_blocks=preserve_blocks)
 
     def _resolve_normalized_section_title(self, title, aliases=None):
         candidate = str(title or '').strip()
@@ -5007,6 +6119,10 @@ class PaperWritePage(WorkspaceStateMixin):
         # introduced by the Tk text widget around the stored section body.
         return '\n'.join(lines).strip('\n')
 
+    @staticmethod
+    def _normalize_import_section_body(text):
+        return str(text or '').replace('\r\n', '\n').replace('\r', '\n').strip('\n')
+
     @classmethod
     def _build_outline_structure(cls, text):
         lines = str(text or '').replace('\r\n', '\n').replace('\r', '\n').split('\n')
@@ -5043,6 +6159,442 @@ class PaperWritePage(WorkspaceStateMixin):
             parents[title] = heading['parent']
         return {
             'sections': sections,
+            'order': order,
+            'levels': levels,
+            'parents': parents,
+        }
+
+    @staticmethod
+    def _block_toc_like(block):
+        if not isinstance(block, dict):
+            return False
+        if bool(block.get('is_toc_like', False)):
+            return True
+        text = re.sub(r'\s+', ' ', str(block.get('text', '') or '').strip())
+        if not text:
+            return False
+        plain = text.strip('：:').lower()
+        if plain in {'目录', 'contents', 'table of contents'}:
+            return True
+        if re.search(r'(?:\.{2,}|…{2,}|·{2,}|_{2,})\s*\d+\s*$', text):
+            return True
+        style_text = f'{block.get("style_name", "")} {block.get("style_id", "")}'.lower()
+        return 'toc' in style_text or '目录' in style_text
+
+    @staticmethod
+    def _coerce_block_outline_level(block):
+        try:
+            level = int((block or {}).get('outline_level', -1))
+        except Exception:
+            return -1
+        return level if 0 <= level <= 8 else -1
+
+    @classmethod
+    def _heading_from_docx_metadata(cls, block):
+        if not isinstance(block, dict) or block.get('type') != 'paragraph':
+            return None
+        text = str(block.get('text', '') or '').strip()
+        if not text or cls._block_toc_like(block):
+            return None
+        if cls._looks_like_descriptive_chapter_sentence(text):
+            return None
+
+        style_text = f'{block.get("style_name", "")} {block.get("style_id", "")}'.strip()
+        style_lower = style_text.lower()
+        outline_level = cls._coerce_block_outline_level(block)
+        level = 0
+        style_match = re.search(r'(?:heading|标题)\s*([1-9一二三四五六七八九])', style_lower, re.IGNORECASE)
+        if style_match:
+            raw_level = style_match.group(1)
+            cn_level_map = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+            try:
+                level = int(raw_level)
+            except Exception:
+                level = cn_level_map.get(raw_level, 0)
+        elif outline_level >= 0:
+            level = outline_level + 1
+        if level <= 0 or level > 3:
+            return None
+
+        parsed = cls._analyze_outline_heading(text)
+        if parsed:
+            if (
+                parsed.get('style') in {'chapter', 'decimal', 'single_number', 'cn_enum', 'cn_paren', 'arabic_paren'}
+                and cls._looks_like_import_body_sentence(parsed.get('body', ''))
+            ):
+                return None
+            result = dict(parsed)
+            result['level'] = min(max(level, 1), 3)
+            result['style'] = 'docx_style'
+            return result
+
+        special_kind = cls._classify_plain_special_heading(text)
+        if special_kind:
+            return {
+                'title': text,
+                'level': min(max(level, 1), 3),
+                'prefix': '',
+                'body': text,
+                'style': 'docx_style',
+            }
+
+        if cls._looks_like_import_body_sentence(text):
+            return None
+
+        return {
+            'title': cls._build_markdown_outline_title(text, min(max(level, 1), 3)),
+            'level': min(max(level, 1), 3),
+            'prefix': '',
+            'body': text,
+            'style': 'docx_style',
+        }
+
+    @staticmethod
+    def _metadata_numeric_score(block):
+        score = 0
+        try:
+            font_size = float((block or {}).get('font_size_pt') or 0)
+        except Exception:
+            font_size = 0
+        try:
+            bold_ratio = float((block or {}).get('bold_ratio') or 0)
+        except Exception:
+            bold_ratio = 0
+        alignment = str((block or {}).get('alignment', '') or '').lower()
+        style_text = f'{(block or {}).get("style_name", "")} {(block or {}).get("style_id", "")}'.lower()
+        if font_size >= 13.5:
+            score += 2
+        elif font_size >= 12.5:
+            score += 1
+        if bold_ratio >= 0.8:
+            score += 2
+        elif bold_ratio >= 0.5:
+            score += 1
+        if 'center' in alignment or alignment == '1':
+            score += 1
+        if 'normal' not in style_text and ('正文' not in style_text):
+            score += 1
+        return score
+
+    @staticmethod
+    def _block_has_import_metadata(block):
+        if not isinstance(block, dict):
+            return False
+        for key in ('style_name', 'style_id', 'outline_level', 'font_size_pt', 'bold_ratio', 'alignment', 'is_toc_like'):
+            value = block.get(key, None)
+            if value not in (None, '', -1, False):
+                return True
+        return False
+
+    @staticmethod
+    def _looks_like_descriptive_chapter_sentence(text):
+        value = str(text or '').strip()
+        if not value:
+            return False
+        return bool(
+            re.match(
+                r'^\s*\u7b2c[\u4e00-\u4e5d\u5341\u767e\u5343\u4e07\d]+(?:\u7ae0|\u8282|\u90e8\u5206|\u7bc7)\s*'
+                r'(?:\u4e3a|\u662f|\u5c06|\u4f1a|\u4e3b\u8981|\u91cd\u70b9|\u56f4\u7ed5|\u805a\u7126|'
+                r'\u5305\u62ec|\u4ecb\u7ecd|\u9610\u8ff0|\u5206\u6790|\u8ba8\u8bba|\u8bf4\u660e|'
+                r'\u5c55\u5f00|\u603b\u7ed3|\u660e\u786e|\u63a2\u8ba8)',
+                value,
+            )
+        )
+
+    @staticmethod
+    def _looks_like_import_body_sentence(text):
+        value = str(text or '').strip()
+        if not value:
+            return True
+        compact = re.sub(r'\s+', '', value)
+        if len(compact) > 70:
+            return True
+        if re.search(r'[\u3002\uff01\uff1f?!\uff1b;]$', value):
+            return True
+        if len(compact) >= 24 and re.search(r'[\uff0c\u3001\uff1b\uff1a,:]', value):
+            return True
+        body_leads = (
+            '\u7814\u7a76\u5bf9\u8c61', '\u6837\u672c\u6765\u6e90', '\u5b9e\u9a8c\u8fc7\u7a0b', '\u6570\u636e\u6765\u6e90', '\u8c03\u67e5\u5bf9\u8c61',
+            '\u672c\u6587', '\u672c\u7814\u7a76', '\u672c\u8bba\u6587', '\u5177\u4f53\u800c\u8a00', '\u9996\u5148', '\u5176\u6b21', '\u6700\u540e',
+        )
+        if value.startswith(body_leads):
+            return True
+        sentence_leads = (
+            '\u4e3a', '\u662f', '\u5c06', '\u4f1a', '\u4e3b\u8981', '\u91cd\u70b9', '\u56f4\u7ed5',
+            '\u805a\u7126', '\u5305\u62ec', '\u4ecb\u7ecd', '\u9610\u8ff0', '\u5206\u6790', '\u8ba8\u8bba',
+            '\u8bf4\u660e', '\u5c55\u5f00', '\u603b\u7ed3', '\u660e\u786e', '\u63a2\u8ba8',
+        )
+        if value.startswith(sentence_leads):
+            return len(compact) >= 10 or bool(re.search(r'[\uff0c\u3001\uff1b\uff1a,:]', value))
+        return False
+
+    @staticmethod
+    def _looks_like_numbered_body_sentence(text):
+        return PaperWritePage._looks_like_import_body_sentence(text)
+        value = str(text or '').strip()
+        if not value:
+            return True
+        if len(value) > 70:
+            return True
+        if re.search(r'[。！？?!；;，,]$', value):
+            return True
+        body_leads = (
+            '研究对象', '样本来源', '实验过程', '数据来源', '调查对象',
+            '本文', '本研究', '本论文', '具体而言', '首先', '其次', '最后',
+        )
+        return value.startswith(body_leads)
+
+    @classmethod
+    def _heading_from_import_block(cls, block):
+        metadata_heading = cls._heading_from_docx_metadata(block)
+        if metadata_heading:
+            return metadata_heading
+        if not isinstance(block, dict) or block.get('type') != 'paragraph' or cls._block_toc_like(block):
+            return None
+
+        text = str(block.get('text', '') or '').strip()
+        if cls._looks_like_descriptive_chapter_sentence(text):
+            return None
+        parsed = cls._analyze_outline_heading(text)
+        if not parsed:
+            return None
+
+        style = parsed.get('style')
+        if style in {'chapter', 'decimal', 'single_number', 'cn_enum', 'cn_paren', 'arabic_paren'}:
+            body = str(parsed.get('body', '') or '').strip()
+            if cls._looks_like_import_body_sentence(body):
+                return None
+        if style in {'markdown', 'chapter', 'decimal', 'plain_special'}:
+            return parsed
+
+        if style in {'single_number', 'cn_enum', 'cn_paren', 'arabic_paren'}:
+            body = str(parsed.get('body', '') or '').strip()
+            if cls._looks_like_numbered_body_sentence(body):
+                return None
+            if cls._block_has_import_metadata(block) and cls._metadata_numeric_score(block) < 2:
+                return None
+            return parsed
+
+        return None
+
+    @classmethod
+    def _build_ai_import_blocks_payload(cls, blocks):
+        payload = []
+        for index, block in enumerate(sanitize_blocks(blocks)):
+            block_type = str(block.get('type', '') or '').strip()
+            if block_type == 'paragraph':
+                text = str(block.get('text', '') or '').strip()
+                if not text:
+                    continue
+                payload.append(
+                    {
+                        'index': index,
+                        'type': 'paragraph',
+                        'text': text[:500],
+                        'style_name': str(block.get('style_name', '') or '')[:80],
+                        'outline_level': block.get('outline_level', -1),
+                        'font_size_pt': block.get('font_size_pt', ''),
+                        'bold_ratio': block.get('bold_ratio', 0),
+                        'alignment': str(block.get('alignment', '') or '')[:40],
+                        'is_toc_like': bool(cls._block_toc_like(block)),
+                    }
+                )
+                continue
+            if block_type == 'table':
+                rows = block.get('rows', []) or []
+                caption = str(block.get('caption', '') or '').strip()
+                preview_rows = []
+                for row in rows[:3]:
+                    preview_rows.append([str(cell or '')[:80] for cell in list(row)[:5]])
+                payload.append(
+                    {
+                        'index': index,
+                        'type': 'table',
+                        'caption': caption[:120],
+                        'rows_preview': preview_rows,
+                        'row_count': len(rows),
+                    }
+                )
+        return payload
+
+    @staticmethod
+    def _extract_json_object(text):
+        raw = str(text or '').strip()
+        if not raw:
+            raise RuntimeError('AI识别未返回内容')
+        if raw.startswith('```'):
+            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
+            raw = re.sub(r'\s*```$', '', raw).strip()
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start < 0 or end < start:
+            raise RuntimeError('AI识别结果不是 JSON 对象')
+        try:
+            payload = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f'AI识别结果 JSON 解析失败：{exc}') from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError('AI识别结果不是 JSON 对象')
+        return payload
+
+    @classmethod
+    def _normalize_ai_import_title(cls, title, level):
+        text = str(title or '').strip()
+        if not text:
+            return ''
+        markdown = cls.OUTLINE_MARKDOWN_RE.match(cls._strip_outline_emphasis(text))
+        if markdown:
+            return cls._build_markdown_outline_title(markdown.group(2).strip(), level)
+        return cls._build_markdown_outline_title(text, level)
+
+    @classmethod
+    def _build_outline_structure_from_ai_payload(cls, ai_payload, blocks):
+        sanitized = sanitize_blocks(blocks)
+        sections_payload = ai_payload.get('sections') if isinstance(ai_payload, dict) else None
+        if not isinstance(sections_payload, list):
+            raise RuntimeError('AI识别结果缺少 sections 数组')
+        index_map = {index: block for index, block in enumerate(sanitized)}
+
+        sections = {}
+        section_blocks = {}
+        order = []
+        levels = {}
+        parents = {}
+        stack = []
+        used_block_indexes = set()
+
+        def allocate_title(proposed):
+            base = str(proposed or '').strip() or '# 未命名章节'
+            candidate = base
+            suffix = 2
+            while candidate in sections:
+                candidate = f'{base} ({suffix})'
+                suffix += 1
+            return candidate
+
+        for item in sections_payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                level = int(item.get('level', 1) or 1)
+            except Exception:
+                level = 1
+            level = max(1, min(level, 3))
+            title = allocate_title(cls._normalize_ai_import_title(item.get('title', ''), level))
+            if not title:
+                continue
+            body_blocks = []
+            for raw_index in item.get('blocks', []) or []:
+                try:
+                    block_index = int(raw_index)
+                except Exception:
+                    continue
+                block = index_map.get(block_index)
+                if not block or block_index in used_block_indexes:
+                    continue
+                if cls._block_toc_like(block):
+                    used_block_indexes.add(block_index)
+                    continue
+                body_blocks.append(block)
+                used_block_indexes.add(block_index)
+
+            while stack and stack[-1]['level'] >= level:
+                stack.pop()
+            parent_title = stack[-1]['title'] if stack else ''
+            sections[title] = cls._normalize_import_section_body(blocks_to_plain_text(body_blocks))
+            section_blocks[title] = deep_copy_blocks(body_blocks)
+            order.append(title)
+            levels[title] = level
+            parents[title] = parent_title
+            stack.append({'title': title, 'level': level})
+
+        if not order:
+            raise RuntimeError('AI识别结果没有有效章节')
+
+        return {
+            'sections': sections,
+            'section_blocks': section_blocks,
+            'order': order,
+            'levels': levels,
+            'parents': parents,
+        }
+
+    def _build_outline_structure_with_ai(self, blocks):
+        payload = self._build_ai_import_blocks_payload(blocks)
+        if not payload:
+            return self._empty_outline_structure()
+        response = self.writer.import_outline_with_ai(payload)
+        parsed_payload = self._extract_json_object(response)
+        return self._build_outline_structure_from_ai_payload(parsed_payload, blocks)
+
+    @classmethod
+    def _build_outline_structure_from_blocks(cls, blocks):
+        sanitized = sanitize_blocks(blocks)
+        if not sanitized:
+            return cls._empty_outline_structure()
+
+        sections = {}
+        section_blocks = {}
+        order = []
+        levels = {}
+        parents = {}
+        stack = []
+        current_title = ''
+        fallback_blocks = []
+
+        def ensure_section(parsed_heading):
+            nonlocal current_title
+            title = parsed_heading['title']
+            level = parsed_heading['level']
+            while stack and stack[-1]['level'] >= level:
+                stack.pop()
+            parent_title = stack[-1]['title'] if stack else ''
+            heading = {'title': title, 'level': level, 'parent': parent_title}
+            stack.append(heading)
+            if title not in sections:
+                sections[title] = ''
+                section_blocks[title] = []
+                order.append(title)
+            levels[title] = level
+            parents[title] = parent_title
+            current_title = title
+
+        for block in sanitized:
+            if cls._block_toc_like(block):
+                continue
+            if block.get('type') == 'paragraph':
+                heading = cls._heading_from_import_block(block)
+                if heading:
+                    ensure_section(heading)
+                    continue
+            if current_title:
+                section_blocks.setdefault(current_title, []).append(block)
+            else:
+                fallback_blocks.append(block)
+
+        if not order:
+            fallback_title = '未解析大纲'
+            fallback_text = blocks_to_plain_text(fallback_blocks or sanitized)
+            return {
+                'sections': {fallback_title: fallback_text},
+                'section_blocks': {fallback_title: deep_copy_blocks(fallback_blocks or sanitized)},
+                'order': [fallback_title],
+                'levels': {fallback_title: 1},
+                'parents': {fallback_title: ''},
+            }
+
+        if fallback_blocks:
+            first_title = order[0]
+            section_blocks[first_title] = deep_copy_blocks(fallback_blocks) + section_blocks.get(first_title, [])
+
+        for title in order:
+            sections[title] = cls._normalize_import_section_body(
+                blocks_to_plain_text(section_blocks.get(title, []))
+            )
+
+        return {
+            'sections': sections,
+            'section_blocks': section_blocks,
             'order': order,
             'levels': levels,
             'parents': parents,
@@ -6249,8 +7801,34 @@ class PaperWritePage(WorkspaceStateMixin):
             target_top = max(row_bottom - canvas_height, 0)
             self._outline_canvas.yview_moveto(min(target_top / content_height, 1))
 
+    def _section_has_displayable_content(self, title):
+        section = str(title or '').strip()
+        if not section:
+            return False
+        blocks = self._section_blocks.get(section, [])
+        if isinstance(blocks, list) and blocks:
+            return True
+        return bool(self._normalize_section_body(self._sections.get(section, '')))
+
+    def _find_first_displayable_descendant(self, title):
+        section = str(title or '').strip()
+        if not section:
+            return ''
+        for child in self._section_children.get(section, []):
+            if self._section_has_displayable_content(child):
+                return child
+            descendant = self._find_first_displayable_descendant(child)
+            if descendant:
+                return descendant
+        return ''
+
     def _resolve_editor_display_source(self, title):
-        return title
+        section = str(title or '').strip()
+        if not section or section not in self._sections:
+            return section
+        if self._section_has_displayable_content(section):
+            return section
+        return self._find_first_displayable_descendant(section) or section
 
     def _load_section_into_editor(self, source_title):
         content = self._normalize_section_body(self._sections.get(source_title, ''))
@@ -6554,9 +8132,9 @@ class PaperWritePage(WorkspaceStateMixin):
         self._outline_selected.set(title)
         for candidate in list(getattr(self, '_outline_row_widgets', {}).keys()):
             self._set_outline_row_visual(candidate)
-        self.section_entry.delete(0, tk.END)
-        self.section_entry.insert(0, title)
         display_source = self._resolve_editor_display_source(title)
+        self.section_entry.delete(0, tk.END)
+        self.section_entry.insert(0, display_source or title)
         self._load_section_into_editor(display_source)
         self.frame.after_idle(lambda target=title: self._scroll_outline_selection_into_view(target))
         if touch_context:

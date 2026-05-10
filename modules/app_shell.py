@@ -4523,6 +4523,10 @@ class SmartPaperTool:
             'request_model': '按请求模型匹配',
             'response_model': '按返回模型匹配',
         }
+        import_recognition_display = {
+            'local': '本地识别',
+            'ai': 'AI识别',
+        }
         startup_display = {
             'home': '首页',
             'api_config': '模型配置',
@@ -4530,6 +4534,7 @@ class SmartPaperTool:
         }
         theme_reverse = {label: key for key, label in theme_display.items()}
         billing_mode_reverse = {label: key for key, label in billing_mode_display.items()}
+        import_recognition_reverse = {label: key for key, label in import_recognition_display.items()}
         startup_reverse = {label: key for key, label in startup_display.items()}
         billing_settings = self.config_mgr.get_global_billing_settings()
         parameter_settings = self.config_mgr.get_global_parameter_settings()
@@ -4546,6 +4551,12 @@ class SmartPaperTool:
         )
         home_stats_var = tk.BooleanVar(value=self.config_mgr.get_setting('show_home_stats', True))
         loading_var = tk.BooleanVar(value=self.config_mgr.get_setting('enable_loading_animation', True))
+        import_recognition_var = tk.StringVar(
+            value=import_recognition_display.get(
+                self.config_mgr.get_setting('paper_write_import_recognition_mode', 'local'),
+                '本地识别',
+            )
+        )
         global_test_prompt_var = tk.StringVar(value=self.config_mgr.get_setting('global_test_prompt', 'Who are you?'))
         global_test_timeout_var = tk.StringVar(value=str(self.config_mgr.get_setting('global_test_timeout_sec', 45)))
         global_test_degrade_var = tk.StringVar(value=str(self.config_mgr.get_setting('global_test_degrade_ms', 6000)))
@@ -4956,6 +4967,14 @@ class SmartPaperTool:
         )
         add_toggle(general_page, '首页统计面板', '保留原有首页统计显示偏好，可随时关闭或重新开启统计区。', home_stats_var)
         add_toggle(general_page, '加载动画', '保留原有 loading.gif 加载动画开关，控制异步操作的视觉反馈。', loading_var)
+        add_select(
+            general_page,
+            '论文导入识别方式',
+            '本地识别使用 Word 样式和格式信号解析大纲；AI识别会调用当前模型识别结构，但不会上传原始 DOCX 文件。',
+            textvariable=import_recognition_var,
+            values=list(import_recognition_display.values()),
+            width=16,
+        )
 
         model_test_shell = tk.Frame(advanced_page, bg=COLORS['shadow'], bd=0, highlightthickness=0)
         model_test_shell.pack(fill=tk.X, pady=(0, 14))
@@ -5584,6 +5603,10 @@ class SmartPaperTool:
             self.config_mgr.set_setting('startup_page', startup_page)
             self.config_mgr.set_setting('show_home_stats', home_stats_var.get())
             self.config_mgr.set_setting('enable_loading_animation', loading_var.get())
+            self.config_mgr.set_setting(
+                'paper_write_import_recognition_mode',
+                import_recognition_reverse.get(import_recognition_var.get(), 'local'),
+            )
             self.config_mgr.set_setting('launch_on_startup', launch_on_startup_var.get())
             self.config_mgr.set_setting('silent_startup', silent_startup_var.get())
             self.config_mgr.set_setting('minimize_to_tray_on_minimize', minimize_to_tray_on_minimize_var.get())
@@ -5633,6 +5656,7 @@ class SmartPaperTool:
                 f'silent_startup={silent_startup_var.get()}, '
                 f'minimize_to_tray_on_minimize={minimize_to_tray_on_minimize_var.get()}, '
                 f'minimize_to_tray_on_close={minimize_to_tray_on_close_var.get()}, '
+                f'paper_write_import_recognition_mode={import_recognition_reverse.get(import_recognition_var.get(), "local")}, '
                 f'global_max_tokens={(global_parameter_vars["max_tokens"].get() or "").strip() or "-"}, '
                 f'global_timeout={(global_parameter_vars["timeout"].get() or "").strip() or "-"}, '
                 f'global_billing_multiplier={billing_multiplier_text or "1"}, '

@@ -17,6 +17,12 @@
     "default_description": "论文写作页的摘要生成默认模板。",
     "default_prompt": "## 角色\n你是一位专业的学术写作助手，擅长撰写规范凝练的论文摘要。\n\n## 任务\n根据整篇论文内容，生成结构完整的学术摘要与关键词。\n\n## 输入变量\n- {full_text}：论文全文\n- {language}：摘要语言（可为空）\n\n## 输出格式\n严格按以下两行块输出，不要任何额外文字、不要 Markdown 代码围栏：\n\n【摘要】<摘要正文，200-300 字>\n【关键词】词1；词2；词3；词4；词5\n\n若 {language} 明确为英文/English，改为：\n\n[Abstract] <abstract body, 150-250 words>\n[Keywords] keyword1; keyword2; keyword3; keyword4; keyword5\n\n## 硬约束\n1. 摘要必须依序体现：研究目的、方法、结果、结论四个要素。\n2. 语言客观、凝练、书面化，不使用\"本文将\"\"笔者认为\"等第一人称表达。\n3. 关键词 5-8 个；中文摘要使用全角分号 `；` 分隔，英文摘要使用半角分号加空格 `; ` 分隔。\n4. 若 {language} 为空或不可识别，默认使用中文，按【摘要】/【关键词】格式输出。\n5. 中文摘要不超过 300 字；英文摘要不超过 250 词。\n6. 不得复述论文全文，也不得复述输入变量或本提示词。\n7. 不输出除【摘要】与【关键词】（或英文等价块）以外的任何字符。\n\n## 直接输出\n论文内容：\n{full_text}\n\n摘要语言：{language}\n\n现在直接输出最终摘要与关键词。"
   },
+  "paper_write.import_outline": {
+    "system": "你是一位严谨的论文文档结构识别助手，只输出严格合法的 JSON 对象。",
+    "default_name": "系统默认提示词",
+    "default_description": "论文写作页 AI 导入识别默认模板。",
+    "default_prompt": "## 任务\n根据本地程序提取的 DOCX 结构块，识别论文标题层级与正文归属。\n\n## 输入\n{document_blocks}\n\n## 输出格式\n只输出严格 JSON 对象，不要 Markdown 代码围栏，不要解释文字。格式如下：\n{{\"sections\":[{{\"title\":\"# 一级标题\",\"level\":1,\"blocks\":[3,4]}},{{\"title\":\"## 二级标题\",\"level\":2,\"blocks\":[6]}}]}}\n\n## 字段要求\n1. sections 必须是数组，按文档原始顺序排列。\n2. title 必须保留原文标题含义，一级标题以 # 开头，二级标题以 ## 开头，三级标题以 ### 开头。\n3. level 只能是 1、2、3。\n4. blocks 是正文块编号数组，只能引用输入中 index 字段存在的块编号；标题块本身不要放入 blocks。\n5. 表格块应归属到其前方最近的正文标题。\n\n## 识别规则\n1. 优先使用 style_name、outline_level、font_size_pt、bold_ratio、alignment 判断标题级别。\n2. is_toc_like 为 true 的块、目录标题、目录项、页码引导线不得作为标题或正文。\n3. 正文里的编号句不能误判为标题，例如“1. 研究对象包括……”或“（1）样本来源……”。\n4. 只做结构识别，不改写、不概括、不补写正文。\n\n现在输出 JSON。"
+  },
   "ai_reduce.transform": {
     "system": "你是一位资深学术写作编辑，擅长在不改变核心观点与关键数据的前提下弱化 AI 写作痕迹。",
     "default_name": "系统默认提示词",

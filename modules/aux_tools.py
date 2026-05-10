@@ -8,9 +8,18 @@ import re
 import sys
 import difflib
 import tempfile
+from collections import Counter
 
 from modules.table_blocks import (
+    TABLE_ALIGN_CENTER,
+    TABLE_ALIGN_RIGHT,
+    TABLE_STYLE_GRID,
     TABLE_STYLE_THREE_LINE,
+    blocks_to_plain_text,
+    new_paragraph_block,
+    new_table_block,
+    normalize_table_alignments,
+    normalize_table_alignment,
     normalize_merged_cells,
     parse_markdown_blocks,
     sanitize_blocks,
@@ -101,23 +110,434 @@ class AuxTools:
         flush_paragraph()
         return '\n'.join(lines).rstrip()
 
-    def import_docx(self, filepath: str) -> str:
-        """导入Word文档，返回文本内容"""
+    @staticmethod
+    def _looks_like_table_caption(text: str) -> bool:
+        normalized = re.sub(r'\s+', ' ', str(text or '').strip())
+        return bool(
+            re.match(
+                r'^(?:表|Table)\s*[\d一二三四五六七八九十百千万IVXLCDMivxlcdm]+(?:[\s.．、:：-]|$)',
+                normalized,
+            )
+        )
+
+    @staticmethod
+    def _docx_style_name(style) -> str:
+        try:
+            return str(getattr(style, 'name', '') or '').strip()
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _docx_style_id(style) -> str:
+        try:
+            return str(getattr(style, 'style_id', '') or '').strip()
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _docx_outline_level_from_element(element) -> int:
+        try:
+            from docx.oxml.ns import qn
+            p_pr = element.pPr
+            if p_pr is None:
+                return -1
+            outline = p_pr.find(qn('w:outlineLvl'))
+            if outline is None:
+                return -1
+            value = outline.get(qn('w:val'))
+            if value is None:
+                return -1
+            return max(0, int(value))
+        except Exception:
+            return -1
+
+    @classmethod
+    def _docx_paragraph_outline_level(cls, paragraph) -> int:
+        direct_level = cls._docx_outline_level_from_element(paragraph._p)
+        if direct_level >= 0:
+            return direct_level
+
+        try:
+            style_element = paragraph.style.element
+        except Exception:
+            style_element = None
+        if style_element is None:
+            return -1
+        return cls._docx_outline_level_from_element(style_element)
+
+    @staticmethod
+    def _docx_run_font_size_pt(run):
+        try:
+            size = run.font.size
+            if size is not None:
+                return float(size.pt)
+        except Exception:
+            pass
+        try:
+            style_size = run.style.font.size
+            if style_size is not None:
+                return float(style_size.pt)
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _docx_paragraph_font_size_pt(cls, paragraph):
+        sizes = []
+        for run in paragraph.runs:
+            text = str(run.text or '')
+            if not text.strip():
+                continue
+            size = cls._docx_run_font_size_pt(run)
+            if size is not None:
+                sizes.append(round(size, 2))
+        if sizes:
+            return Counter(sizes).most_common(1)[0][0]
+        try:
+            style_size = paragraph.style.font.size
+            if style_size is not None:
+                return round(float(style_size.pt), 2)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _docx_run_is_bold(run):
+        try:
+            if run.bold is not None:
+                return bool(run.bold)
+        except Exception:
+            pass
+        try:
+            if run.style.font.bold is not None:
+                return bool(run.style.font.bold)
+        except Exception:
+            pass
+        return False
+
+    @classmethod
+    def _docx_paragraph_bold_ratio(cls, paragraph) -> float:
+        total = 0
+        bold = 0
+        for run in paragraph.runs:
+            text = str(run.text or '')
+            visible_len = len(text.strip())
+            if visible_len <= 0:
+                continue
+            total += visible_len
+            if cls._docx_run_is_bold(run):
+                bold += visible_len
+        if total <= 0:
+            try:
+                return 1.0 if bool(paragraph.style.font.bold) else 0.0
+            except Exception:
+                return 0.0
+        return bold / total
+
+    @staticmethod
+    def _docx_paragraph_alignment(paragraph) -> str:
+        value = paragraph.alignment
+        if value is None:
+            return ''
+        name = getattr(value, 'name', '')
+        if name:
+            return str(name).lower()
+        try:
+            return str(int(value))
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _docx_cell_alignment(cls, tc, parent_table) -> str:
+        try:
+            from docx.table import _Cell
+            cell = _Cell(tc, parent_table)
+            for paragraph in cell.paragraphs:
+                alignment = cls._docx_paragraph_alignment(paragraph)
+                if alignment:
+                    return normalize_table_alignment(alignment)
+        except Exception:
+            pass
+        return normalize_table_alignment('')
+
+    @staticmethod
+    def _looks_like_toc_paragraph(text: str, style_name: str = '', style_id: str = '') -> bool:
+        normalized = re.sub(r'\s+', ' ', str(text or '').strip())
+        plain = normalized.strip('：:').lower()
+        style_hint = f'{style_name} {style_id}'.lower()
+        if not normalized:
+            return False
+        if 'toc' in style_hint or '目录' in style_hint:
+            return True
+        if plain in {'目录', 'contents', 'table of contents'}:
+            return True
+        if re.search(r'(?:\.{2,}|…{2,}|·{2,}|_{2,})\s*\d+\s*$', normalized):
+            return True
+        return bool(re.search(r'\s+\d+\s*$', normalized) and re.match(r'^(?:第[一二三四五六七八九十百千万\d]+章|[一二三四五六七八九十百千万\d]+(?:\.\d+){0,3})\s+', normalized))
+
+    @classmethod
+    def _docx_paragraph_block(cls, paragraph, text: str):
+        style = getattr(paragraph, 'style', None)
+        style_name = cls._docx_style_name(style)
+        style_id = cls._docx_style_id(style)
+        metadata = {
+            'style_name': style_name,
+            'style_id': style_id,
+            'outline_level': cls._docx_paragraph_outline_level(paragraph),
+            'font_size_pt': cls._docx_paragraph_font_size_pt(paragraph),
+            'bold_ratio': cls._docx_paragraph_bold_ratio(paragraph),
+            'alignment': cls._docx_paragraph_alignment(paragraph),
+            'is_toc_like': cls._looks_like_toc_paragraph(text, style_name, style_id),
+        }
+        return new_paragraph_block(text, **metadata)
+
+    @staticmethod
+    def _docx_grid_span(tc) -> int:
+        try:
+            grid_span = tc.tcPr.gridSpan if tc.tcPr is not None else None
+            return max(1, int(grid_span.val)) if grid_span is not None else 1
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _docx_vmerge_value(tc) -> str:
+        try:
+            vmerge = tc.tcPr.vMerge if tc.tcPr is not None else None
+            if vmerge is None:
+                return ''
+            value = vmerge.val
+            return str(value or 'continue').strip().lower()
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _extract_docx_cell_text(tc, parent_table) -> str:
+        try:
+            from docx.table import _Cell
+            return str(_Cell(tc, parent_table).text or '').replace('\r', '').strip()
+        except Exception:
+            try:
+                paragraphs = []
+                for paragraph in tc.xpath('./w:p'):
+                    text = ''.join(paragraph.xpath('.//w:t/text()')).strip()
+                    if text:
+                        paragraphs.append(text)
+                return '\n'.join(paragraphs).strip()
+            except Exception:
+                try:
+                    return ''.join(tc.xpath('.//w:t/text()')).strip()
+                except Exception:
+                    return ''
+
+    @classmethod
+    def _docx_table_column_count(cls, table) -> int:
+        grid_count = 0
+        try:
+            grid_count = len(table._tbl.tblGrid.gridCol_lst)
+        except Exception:
+            grid_count = 0
+
+        row_width = 0
+        try:
+            for tr in table._tbl.tr_lst:
+                width = 0
+                for tc in tr.tc_lst:
+                    width += cls._docx_grid_span(tc)
+                row_width = max(row_width, width)
+        except Exception:
+            row_width = 0
+        return max(1, grid_count, row_width)
+
+    @staticmethod
+    def _docx_cell_border_value(tc, edge: str) -> str:
+        try:
+            from docx.oxml.ns import qn
+            tc_pr = tc.tcPr
+            tc_borders = tc_pr.first_child_found_in('w:tcBorders') if tc_pr is not None else None
+            if tc_borders is None:
+                return ''
+            element = tc_borders.find(qn(f'w:{edge}'))
+            if element is None:
+                return ''
+            return str(element.get(qn('w:val')) or 'single').strip().lower()
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _docx_table_border_value(table, edge: str) -> str:
+        try:
+            from docx.oxml.ns import qn
+            tbl_pr = table._tbl.tblPr
+            tbl_borders = tbl_pr.first_child_found_in('w:tblBorders') if tbl_pr is not None else None
+            if tbl_borders is None:
+                return ''
+            element = tbl_borders.find(qn(f'w:{edge}'))
+            if element is None:
+                return ''
+            return str(element.get(qn('w:val')) or 'single').strip().lower()
+        except Exception:
+            return ''
+
+    @classmethod
+    def _detect_docx_table_style(cls, table) -> str:
+        try:
+            style_name = str(getattr(getattr(table, 'style', None), 'name', '') or '').lower()
+            if '三线' in style_name or ('three' in style_name and 'line' in style_name):
+                return TABLE_STYLE_THREE_LINE
+        except Exception:
+            pass
+
+        no_line_values = {'nil', 'none'}
+
+        def has_line(value):
+            return bool(value) and value not in no_line_values
+
+        def no_line(value):
+            return bool(value) and value in no_line_values
+
+        table_top = cls._docx_table_border_value(table, 'top')
+        table_bottom = cls._docx_table_border_value(table, 'bottom')
+        table_vertical = [
+            cls._docx_table_border_value(table, edge)
+            for edge in ('left', 'right', 'insideV')
+        ]
+        if has_line(table_top) and has_line(table_bottom) and not any(has_line(value) for value in table_vertical):
+            return TABLE_STYLE_THREE_LINE
+
+        try:
+            rows = list(table._tbl.tr_lst)
+        except Exception:
+            rows = []
+        if not rows:
+            return TABLE_STYLE_GRID
+
+        first_row = list(rows[0].tc_lst)
+        last_row = list(rows[-1].tc_lst)
+        if not first_row or not last_row:
+            return TABLE_STYLE_GRID
+
+        def all_cells_have_line(cells, edge):
+            values = [cls._docx_cell_border_value(tc, edge) for tc in cells]
+            values = [value for value in values if value]
+            return bool(values) and all(has_line(value) for value in values)
+
+        vertical_values = []
+        for tr in rows:
+            for tc in tr.tc_lst:
+                vertical_values.append(cls._docx_cell_border_value(tc, 'left'))
+                vertical_values.append(cls._docx_cell_border_value(tc, 'right'))
+        vertical_values = [value for value in vertical_values if value]
+        vertical_no_line = bool(vertical_values) and all(no_line(value) for value in vertical_values)
+
+        if (
+            vertical_no_line
+            and all_cells_have_line(first_row, 'top')
+            and all_cells_have_line(first_row, 'bottom')
+            and all_cells_have_line(last_row, 'bottom')
+        ):
+            return TABLE_STYLE_THREE_LINE
+        return TABLE_STYLE_GRID
+
+    @classmethod
+    def _docx_table_to_block(cls, table, caption: str = ''):
+        col_count = cls._docx_table_column_count(table)
+        rows = []
+        cell_alignments = []
+        merged_cells = []
+        active_vmerges = {}
+
+        for row_idx, tr in enumerate(table._tbl.tr_lst):
+            row_values = [''] * col_count
+            row_alignments = [normalize_table_alignment('') for _col in range(col_count)]
+            col_idx = 0
+            next_vmerges = {}
+            for tc in tr.tc_lst:
+                if col_idx >= col_count:
+                    break
+                colspan = min(cls._docx_grid_span(tc), col_count - col_idx)
+                vmerge = cls._docx_vmerge_value(tc)
+                if vmerge == 'continue':
+                    active = active_vmerges.get(col_idx)
+                    if active is not None:
+                        active['rowspan'] += 1
+                        next_vmerges[col_idx] = active
+                else:
+                    row_values[col_idx] = cls._extract_docx_cell_text(tc, table)
+                    alignment = cls._docx_cell_alignment(tc, table)
+                    for span_idx in range(col_idx, min(col_idx + colspan, col_count)):
+                        row_alignments[span_idx] = alignment
+                    if vmerge == 'restart':
+                        active = {
+                            'row': row_idx,
+                            'col': col_idx,
+                            'rowspan': 1,
+                            'colspan': colspan,
+                        }
+                        merged_cells.append(active)
+                        next_vmerges[col_idx] = active
+                    elif colspan > 1:
+                        merged_cells.append({
+                            'row': row_idx,
+                            'col': col_idx,
+                            'rowspan': 1,
+                            'colspan': colspan,
+                        })
+                col_idx += colspan
+            rows.append(row_values)
+            cell_alignments.append(row_alignments)
+            active_vmerges = next_vmerges
+
+        return new_table_block(
+            rows or [['']],
+            caption=caption,
+            merged_cells=merged_cells,
+            table_style=cls._detect_docx_table_style(table),
+            cell_alignments=cell_alignments,
+        )
+
+    def import_docx_blocks(self, filepath: str) -> dict:
+        """导入 Word 文档，返回结构化内容块。"""
         try:
             normalized_path = os.path.abspath(os.path.expanduser(str(filepath or '').strip()))
             if not normalized_path.lower().endswith('.docx'):
                 raise RuntimeError('仅支持导入 .docx 格式的 Word 文档')
             import docx
+            from docx.oxml.table import CT_Tbl
+            from docx.oxml.text.paragraph import CT_P
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+
             doc = docx.Document(normalized_path)
-            paragraphs = []
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    paragraphs.append(para.text)
-            return '\n\n'.join(paragraphs)
+            blocks = []
+            for child in doc.element.body.iterchildren():
+                if isinstance(child, CT_P):
+                    paragraph = Paragraph(child, doc)
+                    text = str(paragraph.text or '').strip()
+                    if text:
+                        blocks.append(self._docx_paragraph_block(paragraph, text))
+                    continue
+                if isinstance(child, CT_Tbl):
+                    table = Table(child, doc)
+                    caption = ''
+                    if blocks and blocks[-1].get('type') == 'paragraph':
+                        previous_text = str(blocks[-1].get('text', '') or '').strip()
+                        if self._looks_like_table_caption(previous_text):
+                            caption = previous_text
+                            blocks.pop()
+                    blocks.append(self._docx_table_to_block(table, caption=caption))
+            sanitized = sanitize_blocks(blocks)
+            return {
+                'text': blocks_to_plain_text(sanitized),
+                'blocks': sanitized,
+            }
         except ImportError:
             raise RuntimeError('请安装python-docx库: pip install python-docx')
         except Exception as e:
             raise RuntimeError(f'读取Word文件失败: {e}')
+
+    def import_docx(self, filepath: str) -> str:
+        """导入 Word 文档，返回文本内容。"""
+        return self.import_docx_blocks(filepath).get('text', '')
 
     def export_docx(self, text: str, filepath: str, title: str = '', level_font_styles: dict = None, sections_data: dict = None) -> bool:
         """导出为Word文档。sections_data 可包含 section_order, sections, section_levels, section_blocks。"""
@@ -208,6 +628,14 @@ class AuxTools:
                             borders['bottom'] = strong
                         _set_cell_borders(table.cell(row_idx, col_idx), **borders)
 
+            def _docx_alignment(value):
+                alignment = normalize_table_alignment(value)
+                if alignment == TABLE_ALIGN_CENTER:
+                    return WD_ALIGN_PARAGRAPH.CENTER
+                if alignment == TABLE_ALIGN_RIGHT:
+                    return WD_ALIGN_PARAGRAPH.RIGHT
+                return WD_ALIGN_PARAGRAPH.LEFT
+
             # 设置默认字体
             style = doc.styles['Normal']
             style.font.name = body_font_en
@@ -264,6 +692,11 @@ class AuxTools:
                     len(normalized_rows),
                     max_cols,
                 )
+                cell_alignments = normalize_table_alignments(
+                    block.get('cell_alignments', []),
+                    len(normalized_rows),
+                    max_cols,
+                )
                 covered_cells = set()
                 merge_anchors = {(cell['row'], cell['col']): cell for cell in merged_cells}
                 for merged in merged_cells:
@@ -288,6 +721,7 @@ class AuxTools:
                             )
                         cell.text = cell_text
                         for paragraph in cell.paragraphs:
+                            paragraph.alignment = _docx_alignment(cell_alignments[row_idx][col_idx])
                             paragraph.paragraph_format.space_after = Pt(0)
                             paragraph.paragraph_format.first_line_indent = Pt(0)
                             for run in paragraph.runs:

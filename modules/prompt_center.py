@@ -72,6 +72,16 @@ SCENE_DEFS = {
         ),
         'required_variables': ('full_text',),
     },
+    'paper_write.import_outline': {
+        'page_id': 'paper_write',
+        'page_label': '论文写作',
+        'label': '导入识别',
+        'variables': (
+            ('document_blocks', '文档结构块'),
+        ),
+        'required_variables': ('document_blocks',),
+        'warning': '该提示词仅影响论文写作页的 AI 导入识别，不影响本地导入识别。',
+    },
     'polish.run_task': {
         'page_id': 'polish',
         'page_label': '学术润色',
@@ -173,7 +183,7 @@ for _scene_id, _scene_def in SCENE_DEFS.items():
     PAGE_SCENE_MAP.setdefault(_scene_def['page_id'], []).append(_scene_id)
 
 DEFAULTS_PATH = resolve_resource_path('modules', 'prompt_defaults.json')
-SYSTEM_DEFAULT_SYNC_SCENE_IDS = ('paper_write.outline', 'polish.run_task')
+SYSTEM_DEFAULT_SYNC_SCENE_IDS = ('paper_write.outline', 'paper_write.import_outline', 'polish.run_task')
 
 
 # 冻结的历史 instruction_wrapper：仅用于把旧版本的"纯说明文本"用户提示词一次性迁移为完整模板。

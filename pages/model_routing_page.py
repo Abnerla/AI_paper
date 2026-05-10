@@ -28,6 +28,7 @@ ROUTING_FEATURES = (
 
 ROUTING_SCENES = (
     ('paper_write.outline', '论文写作 · 生成大纲'),
+    ('paper_write.import_outline', '论文写作 · 导入识别'),
     ('paper_write.section', '论文写作 · 撰写章节'),
     ('paper_write.abstract', '论文写作 · 生成摘要'),
     ('polish.run_task', '学术润色 · 统一任务'),

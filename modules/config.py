@@ -169,6 +169,7 @@ class ConfigManager:
                 'global_frequency_penalty': '',
                 'global_billing_multiplier': '',
                 'global_billing_mode': 'request_model',
+                'paper_write_import_recognition_mode': 'local',
                 'home_last_import_failure': None,
                 'usage_pricing_rules': [],
                 'model_routing_mode': 'global',
