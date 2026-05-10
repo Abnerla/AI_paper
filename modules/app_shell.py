@@ -4204,18 +4204,34 @@ class SmartPaperTool:
         apply_adaptive_window_geometry(window, '1600x1200', min_width=1360, min_height=960)
         self._knowledge_base_window = window
 
-        panel = KnowledgeBasePanel(
-            body,
-            self._get_knowledge_base_store(),
-            set_status=self._set_status,
-            close_panel=lambda win=window: self._close_dialog(win),
-        )
-        panel.frame.pack(fill=tk.BOTH, expand=True, padx=28, pady=28)
-        self._knowledge_base_panel = panel
-        return panel
+        try:
+            panel = KnowledgeBasePanel(
+                body,
+                self._get_knowledge_base_store(),
+                set_status=self._set_status,
+                close_panel=lambda win=window: self._close_dialog(win),
+            )
+            panel.frame.pack(fill=tk.BOTH, expand=True, padx=28, pady=28)
+            self._knowledge_base_panel = panel
+            return panel
+        except Exception as exc:
+            self._write_app_log(f'knowledge_base_panel error: {exc}', level='ERROR')
+            import traceback
+            self._write_app_log(traceback.format_exc(), level='ERROR')
+            self._close_dialog(window)
+            messagebox.showerror('知识库', f'打开知识库面板失败：\n{exc}', parent=self.root)
+            return None
 
     def _choose_knowledge_context(self, scene_id, *, page_id='paper_write', action_label='',
                                   total_char_limit=None, per_document_char_limit=None):
+        store = self._get_knowledge_base_store()
+        active_project = store.get_active_project()
+        if not active_project:
+            return {}
+        project_scene_ids = set(active_project.get('bound_scene_ids', []))
+        if scene_id and scene_id not in project_scene_ids:
+            return {}
+
         from pages.knowledge_base_page import KnowledgeContextDialog
 
         if total_char_limit is None or per_document_char_limit is None:
@@ -4227,7 +4243,7 @@ class SmartPaperTool:
 
         dialog = KnowledgeContextDialog(
             self.root,
-            self._get_knowledge_base_store(),
+            store,
             scene_id,
             action_label=action_label,
             total_char_limit=total_char_limit,

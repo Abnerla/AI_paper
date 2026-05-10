@@ -148,7 +148,7 @@ class IntelligentCorrector:
         self.prompt_center = prompt_center or PromptCenter(getattr(api_client, 'config', None))
         self._issue_index = 0
 
-    def analyze_text(self, text, citation_style='auto', source_kind='manual') -> CorrectionRun:
+    def analyze_text(self, text, citation_style='auto', source_kind='manual', knowledge_context=None) -> CorrectionRun:
         content = str(text or '')
         if not content.strip():
             raise ValueError('待纠错文本不能为空')
@@ -171,7 +171,7 @@ class IntelligentCorrector:
         issues.extend(self._check_ai_style(content))
 
         merged = self._merge_issues(issues)
-        ai_issues = self._collect_ai_issues(content, effective_style)
+        ai_issues = self._collect_ai_issues(content, effective_style, knowledge_context)
         all_issues = self._merge_issues([*merged, *ai_issues])
 
         run = CorrectionRun(
@@ -1229,7 +1229,7 @@ class IntelligentCorrector:
                 )
         return issues
 
-    def _collect_ai_issues(self, text, citation_style):
+    def _collect_ai_issues(self, text, citation_style, knowledge_context=None):
         if not self.api or not hasattr(self.api, 'call_json_sync'):
             return []
         rendered = self.prompt_center.render_scene(
@@ -1239,9 +1239,11 @@ class IntelligentCorrector:
                 'citation_style': citation_style,
             },
         )
+        from modules.knowledge_base import append_knowledge_context
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         try:
             payload = self.api.call_json_sync(
-                rendered['prompt'],
+                prompt,
                 system=rendered['system'],
                 temperature=0.2,
                 schema_name='correction_issues',

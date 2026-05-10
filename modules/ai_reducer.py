@@ -5,6 +5,7 @@
 
 import re
 
+from modules.knowledge_base import append_knowledge_context
 from modules.prompt_center import PromptCenter
 from modules.report_importer import ParagraphAnnotation, split_document_paragraphs
 
@@ -150,7 +151,7 @@ class AIReducer:
             'long_sentence_count': len(long_sentences),
         }
 
-    def _render_rewrite_prompt(self, text, mode, mode_label):
+    def _render_rewrite_prompt(self, text, mode, mode_label, knowledge_context=None):
         rendered = self.prompt_center.render_scene(
             'ai_reduce.transform',
             {
@@ -159,11 +160,12 @@ class AIReducer:
                 'mode_label': mode_label,
             },
         )
-        return rendered['system'], rendered['prompt']
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
+        return rendered['system'], prompt
 
-    def rewrite_light(self, text: str) -> str:
+    def rewrite_light(self, text: str, knowledge_context=None) -> str:
         """轻度去痕。"""
-        system, prompt = self._render_rewrite_prompt(text, 'light', '轻度去痕')
+        system, prompt = self._render_rewrite_prompt(text, 'light', '轻度去痕', knowledge_context)
         return self.api.call_sync(
             prompt,
             system,
@@ -171,9 +173,9 @@ class AIReducer:
             usage_context=self._usage_context('rewrite_light'),
         )
 
-    def rewrite_deep(self, text: str) -> str:
+    def rewrite_deep(self, text: str, knowledge_context=None) -> str:
         """深度重构。"""
-        system, prompt = self._render_rewrite_prompt(text, 'deep', '深度重构')
+        system, prompt = self._render_rewrite_prompt(text, 'deep', '深度重构', knowledge_context)
         return self.api.call_sync(
             prompt,
             system,
@@ -181,9 +183,9 @@ class AIReducer:
             usage_context=self._usage_context('rewrite_deep'),
         )
 
-    def rewrite_academic(self, text: str) -> str:
+    def rewrite_academic(self, text: str, knowledge_context=None) -> str:
         """学术拟合。"""
-        system, prompt = self._render_rewrite_prompt(text, 'academic', '学术拟合')
+        system, prompt = self._render_rewrite_prompt(text, 'academic', '学术拟合', knowledge_context)
         return self.api.call_sync(
             prompt,
             system,
@@ -191,7 +193,7 @@ class AIReducer:
             usage_context=self._usage_context('rewrite_academic'),
         )
 
-    def rewrite_with_annotations(self, text: str, annotations: list[ParagraphAnnotation], mode: str) -> str:
+    def rewrite_with_annotations(self, text: str, annotations: list[ParagraphAnnotation], mode: str, knowledge_context=None) -> str:
         """仅改写被标注且纳入执行的正文段落。"""
         paragraph_map = {item.paragraph_id: item for item in annotations or []}
         parts = []
@@ -201,7 +203,7 @@ class AIReducer:
             annotation = paragraph_map.get(paragraph.paragraph_id)
             updated_text = paragraph.text
             if paragraph.kind == 'body' and annotation and annotation.include_in_run and annotation.risk_level != 'safe':
-                updated_text = self._rewrite_by_mode(paragraph.text, mode)
+                updated_text = self._rewrite_by_mode(paragraph.text, mode, knowledge_context=knowledge_context)
                 if not self._preserves_citation_marks(paragraph.text, updated_text):
                     updated_text = paragraph.text
                 if not str(updated_text or '').strip():
@@ -228,12 +230,12 @@ class AIReducer:
             return {cleaned} if cleaned else set()
         return {cleaned[index:index + 2] for index in range(len(cleaned) - 1)}
 
-    def _rewrite_by_mode(self, text: str, mode: str) -> str:
+    def _rewrite_by_mode(self, text: str, mode: str, knowledge_context=None) -> str:
         if mode == 'light':
-            return self.rewrite_light(text)
+            return self.rewrite_light(text, knowledge_context=knowledge_context)
         if mode == 'deep':
-            return self.rewrite_deep(text)
-        return self.rewrite_academic(text)
+            return self.rewrite_deep(text, knowledge_context=knowledge_context)
+        return self.rewrite_academic(text, knowledge_context=knowledge_context)
 
     @staticmethod
     def _preserves_citation_marks(source_text: str, result_text: str) -> bool:

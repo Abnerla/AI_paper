@@ -263,7 +263,17 @@ def run_pyinstaller():
 def create_dmg():
     """生成 macOS 的 .dmg 安装程序。"""
     app_path = os.path.join(DIST_DIR, f'{APP_NAME}.app')
-    dmg_path = build_release_path('.dmg', platform_name='macos')
+
+    # 检测当前架构
+    machine = platform.machine().lower()
+    if machine in ('x86_64', 'amd64'):
+        arch_suffix = 'intel'
+    elif machine in ('arm64', 'aarch64'):
+        arch_suffix = 'apple-silicon'
+    else:
+        arch_suffix = machine
+
+    dmg_path = build_release_path('.dmg', platform_name='macos', suffix=arch_suffix)
 
     if not os.path.isdir(app_path):
         raise FileNotFoundError(f'[build] Missing app bundle: {app_path}')
@@ -279,9 +289,15 @@ def create_dmg():
         '-format', 'UDZO',
         dmg_path,
     ]
-    print(f'[build] Creating DMG: {dmg_path}')
+    print(f'[build] Creating DMG for {arch_suffix}: {dmg_path}')
     subprocess.check_call(cmd)
     print(f'[build] DMG created: {dmg_path}')
+
+    # 同时创建不带架构后缀的通用文件名（向后兼容）
+    generic_dmg_path = build_release_path('.dmg', platform_name='macos')
+    if generic_dmg_path != dmg_path:
+        shutil.copy2(dmg_path, generic_dmg_path)
+        print(f'[build] Generic DMG created: {generic_dmg_path}')
 
 
 def create_appimage():

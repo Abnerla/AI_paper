@@ -6,6 +6,7 @@
 import difflib
 import re
 
+from modules.knowledge_base import append_knowledge_context
 from modules.prompt_center import PromptCenter
 from modules.report_importer import ParagraphAnnotation, split_document_paragraphs
 
@@ -156,7 +157,7 @@ class PlagiarismReducer:
             'has_reference_section': bool(section_match),
         }
 
-    def _render_reduce_prompt(self, text, source_text, mode, mode_label):
+    def _render_reduce_prompt(self, text, source_text, mode, mode_label, knowledge_context=None):
         rendered = self.prompt_center.render_scene(
             'plagiarism.transform',
             {
@@ -166,11 +167,12 @@ class PlagiarismReducer:
                 'mode_label': mode_label,
             },
         )
-        return rendered['system'], rendered['prompt']
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
+        return rendered['system'], prompt
 
-    def reduce_light(self, text: str, source_text: str = '') -> str:
+    def reduce_light(self, text: str, source_text: str = '', knowledge_context=None) -> str:
         """轻度降重。"""
-        system, prompt = self._render_reduce_prompt(text, source_text, 'light', '轻度降重')
+        system, prompt = self._render_reduce_prompt(text, source_text, 'light', '轻度降重', knowledge_context)
         return self.api.call_sync(
             prompt,
             system,
@@ -178,9 +180,9 @@ class PlagiarismReducer:
             usage_context=self._usage_context('reduce_light'),
         )
 
-    def reduce_medium(self, text: str, source_text: str = '') -> str:
+    def reduce_medium(self, text: str, source_text: str = '', knowledge_context=None) -> str:
         """中度降重。"""
-        system, prompt = self._render_reduce_prompt(text, source_text, 'medium', '中度降重')
+        system, prompt = self._render_reduce_prompt(text, source_text, 'medium', '中度降重', knowledge_context)
         return self.api.call_sync(
             prompt,
             system,
@@ -188,9 +190,9 @@ class PlagiarismReducer:
             usage_context=self._usage_context('reduce_medium'),
         )
 
-    def reduce_deep(self, text: str, source_text: str = '') -> str:
+    def reduce_deep(self, text: str, source_text: str = '', knowledge_context=None) -> str:
         """深度降重。"""
-        system, prompt = self._render_reduce_prompt(text, source_text, 'deep', '深度降重')
+        system, prompt = self._render_reduce_prompt(text, source_text, 'deep', '深度降重', knowledge_context)
         return self.api.call_sync(
             prompt,
             system,
@@ -204,6 +206,7 @@ class PlagiarismReducer:
         annotations: list[ParagraphAnnotation],
         mode: str,
         source_text: str = '',
+        knowledge_context=None,
     ) -> str:
         """仅处理被标注且纳入执行的正文段落。"""
         paragraph_map = {item.paragraph_id: item for item in annotations or []}
@@ -229,6 +232,7 @@ class PlagiarismReducer:
                         focus_text,
                         source_excerpt or focus_text,
                         mode,
+                        knowledge_context=knowledge_context,
                     )
                     if self._preserves_citation_marks(focus_text, rewritten_focus) and str(rewritten_focus or '').strip():
                         updated_text = paragraph.text[:local_start] + rewritten_focus + paragraph.text[local_end:]
@@ -237,6 +241,7 @@ class PlagiarismReducer:
                         paragraph.text,
                         source_excerpt or global_source_text,
                         mode,
+                        knowledge_context=knowledge_context,
                     )
                     if not self._preserves_citation_marks(paragraph.text, updated_text):
                         updated_text = paragraph.text
@@ -279,12 +284,12 @@ class PlagiarismReducer:
             result.append(item)
         return result
 
-    def _reduce_by_mode(self, text: str, source_text: str, mode: str) -> str:
+    def _reduce_by_mode(self, text: str, source_text: str, mode: str, knowledge_context=None) -> str:
         if mode == 'light':
-            return self.reduce_light(text, source_text)
+            return self.reduce_light(text, source_text, knowledge_context=knowledge_context)
         if mode == 'medium':
-            return self.reduce_medium(text, source_text)
-        return self.reduce_deep(text, source_text)
+            return self.reduce_medium(text, source_text, knowledge_context=knowledge_context)
+        return self.reduce_deep(text, source_text, knowledge_context=knowledge_context)
 
     @staticmethod
     def _preserves_citation_marks(source_text: str, result_text: str) -> bool:

@@ -3,6 +3,7 @@
 学术润色模块。
 """
 
+from modules.knowledge_base import append_knowledge_context
 from modules.prompt_center import PromptCenter
 
 
@@ -36,6 +37,7 @@ class AcademicPolisher:
         execution_mode: str = '标准模式',
         topic: str = '',
         notes: str = '',
+        knowledge_context=None,
     ) -> str:
         """统一任务入口。"""
         text = (text or '').strip()
@@ -59,55 +61,60 @@ class AcademicPolisher:
                 'notes': notes,
             },
         )
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         temperature = self.TEMPERATURE_MAP.get(execution_mode, 0.4)
         return self.api.call_sync(
-            rendered['prompt'],
+            prompt,
             rendered['system'],
             temperature=temperature,
             usage_context=self._usage_context('run_task'),
         )
 
-    def polish_grammar(self, text: str) -> str:
+    def polish_grammar(self, text: str, knowledge_context=None) -> str:
         """语法和标点修正。"""
         rendered = self.prompt_center.render_scene('polish.grammar', {'text': text})
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         return self.api.call_sync(
-            rendered['prompt'],
+            prompt,
             rendered['system'],
             temperature=0.3,
             usage_context=self._usage_context('polish_grammar', scene_id='polish.grammar'),
         )
 
-    def polish_academic_vocab(self, text: str) -> str:
+    def polish_academic_vocab(self, text: str, knowledge_context=None) -> str:
         """学术词汇替换。"""
         rendered = self.prompt_center.render_scene('polish.academic_vocab', {'text': text})
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         return self.api.call_sync(
-            rendered['prompt'],
+            prompt,
             rendered['system'],
             temperature=0.4,
             usage_context=self._usage_context('polish_academic_vocab', scene_id='polish.academic_vocab'),
         )
 
-    def polish_logic(self, text: str) -> str:
+    def polish_logic(self, text: str, knowledge_context=None) -> str:
         """逻辑和段落优化。"""
         rendered = self.prompt_center.render_scene('polish.logic', {'text': text})
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         return self.api.call_sync(
-            rendered['prompt'],
+            prompt,
             rendered['system'],
             temperature=0.5,
             usage_context=self._usage_context('polish_logic', scene_id='polish.logic'),
         )
 
-    def polish_full(self, text: str) -> str:
+    def polish_full(self, text: str, knowledge_context=None) -> str:
         """全面润色。"""
         rendered = self.prompt_center.render_scene('polish.full', {'text': text})
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         return self.api.call_sync(
-            rendered['prompt'],
+            prompt,
             rendered['system'],
             temperature=0.5,
             usage_context=self._usage_context('polish_full', scene_id='polish.full'),
         )
 
-    def translate_polish(self, text: str, target_lang: str = '英文') -> str:
+    def translate_polish(self, text: str, target_lang: str = '英文', knowledge_context=None) -> str:
         """翻译润色。"""
         rendered = self.prompt_center.render_scene(
             'polish.translate',
@@ -116,8 +123,9 @@ class AcademicPolisher:
                 'target_lang': target_lang,
             },
         )
+        prompt = append_knowledge_context(rendered['prompt'], knowledge_context)
         return self.api.call_sync(
-            rendered['prompt'],
+            prompt,
             rendered['system'],
             temperature=0.4,
             usage_context=self._usage_context('translate_polish', scene_id='polish.translate'),

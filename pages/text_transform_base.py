@@ -225,6 +225,7 @@ class TextTransformPageBase(WorkspaceStateMixin):
         self.frame = tk.Frame(parent, bg=COLORS['bg_main'])
         self.loading = LoadingOverlay(self.frame, config_mgr, text=loading_text)
         self.task_runner = TaskRunner(self.frame, loading=self.loading, set_status=self.set_status)
+        self._pending_knowledge_context = None
 
         self.mode_var = tk.StringVar(value=self.MODE_DEFAULT)
         self.mode_cards = []
@@ -2644,6 +2645,11 @@ class TextTransformPageBase(WorkspaceStateMixin):
 
         mode = self.mode_var.get()
 
+        knowledge_context = self._choose_knowledge_context(self.PROMPT_SCENE_ID)
+        if knowledge_context is None:
+            return
+        self._pending_knowledge_context = knowledge_context
+
         def on_start():
             self._set_text_value(self.output_text, '处理中...')
             self._mark_analysis_stale('结果正在更新，完成后将自动刷新差异视图。')
@@ -2657,6 +2663,17 @@ class TextTransformPageBase(WorkspaceStateMixin):
             status_text=self.ACTION_START_STATUS,
             status_color=COLORS['warning'],
         )
+
+    def _choose_knowledge_context(self, scene_id, action_label=''):
+        if not self.app_bridge or not hasattr(self.app_bridge, 'choose_knowledge_context'):
+            return {}
+        try:
+            return self.app_bridge.choose_knowledge_context(
+                scene_id, page_id=self.PAGE_STATE_ID, action_label=action_label,
+            )
+        except Exception as exc:
+            messagebox.showerror('知识库', str(exc), parent=self.frame)
+            return None
 
     def _finish_transform(self, mode, source_text, result):
         self._set_text_value(self.output_text, result)
@@ -2674,11 +2691,13 @@ class TextTransformPageBase(WorkspaceStateMixin):
             workspace_state=workspace_state,
         )
         self.set_status(self.ACTION_SUCCESS_STATUS)
+        self._pending_knowledge_context = None
 
     def _handle_transform_error(self, exc):
         self._set_text_value(self.output_text, f'错误：{exc}')
         self.set_status(self.ACTION_FAILURE_STATUS, COLORS['error'])
         self._mark_analysis_stale('处理失败，核验结果与差异预览已失效。')
+        self._pending_knowledge_context = None
 
     def _transform_text_with_import_annotations(self, text, mode):
         all_annotations = self._get_all_annotations()

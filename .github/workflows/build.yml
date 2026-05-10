@@ -33,9 +33,15 @@ jobs:
             platform: windows
             artifact_name: AI_Paper-Windows
             artifact_ext: .exe
+          - os: macos-13
+            platform: macos
+            arch: x64
+            artifact_name: AI_Paper-macOS-Intel
+            artifact_ext: .dmg
           - os: macos-latest
             platform: macos
-            artifact_name: AI_Paper-macOS
+            arch: arm64
+            artifact_name: AI_Paper-macOS-AppleSilicon
             artifact_ext: .dmg
           - os: ubuntu-latest
             platform: linux
@@ -43,7 +49,7 @@ jobs:
             artifact_ext: .AppImage
 
     runs-on: ${{ matrix.os }}
-    name: 构建 ${{ matrix.platform }}
+    name: 构建 ${{ matrix.platform }}${{ matrix.arch && format(' ({0})', matrix.arch) || '' }}
     env:
       PYTHONIOENCODING: utf-8
       APPIMAGE_EXTRACT_AND_RUN: 1
@@ -87,6 +93,10 @@ jobs:
           chmod +x appimagetool
           sudo mv appimagetool /usr/local/bin/appimagetool
 
+      - name: 生成 macOS 图标文件
+        if: matrix.platform == 'macos'
+        run: python generate_icns.py
+
       - name: 构建应用和安装程序
         run: python build.py --clean --installer
 
@@ -106,12 +116,20 @@ jobs:
           path: dist/AI_Paper-v*-windows-setup.exe
           if-no-files-found: error
 
-      - name: 上传 macOS 安装程序
-        if: matrix.platform == 'macos'
+      - name: 上传 macOS Intel 安装程序
+        if: matrix.platform == 'macos' && matrix.arch == 'x64'
         uses: actions/upload-artifact@v5
         with:
-          name: AI_Paper-macOS-DMG
-          path: dist/AI_Paper-v*-macos.dmg
+          name: AI_Paper-macOS-Intel-DMG
+          path: dist/AI_Paper-v*-macos-intel.dmg
+          if-no-files-found: error
+
+      - name: 上传 macOS Apple Silicon 安装程序
+        if: matrix.platform == 'macos' && matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v5
+        with:
+          name: AI_Paper-macOS-AppleSilicon-DMG
+          path: dist/AI_Paper-v*-macos-apple-silicon.dmg
           if-no-files-found: error
 
       - name: 上传 Linux AppImage

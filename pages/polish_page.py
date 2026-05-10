@@ -672,6 +672,10 @@ class PolishPage(WorkspaceStateMixin):
         if not self._ensure_prompt_ready('polish.run_task'):
             return
 
+        knowledge_context = self._choose_knowledge_context('polish.run_task', '学术润色')
+        if knowledge_context is None:
+            return
+
         config = self._collect_task_config()
         self.last_task_config = dict(config)
         self.latest_target_summary = ''
@@ -712,6 +716,7 @@ class PolishPage(WorkspaceStateMixin):
                 execution_mode=config['execution_mode'],
                 topic=config['topic'],
                 notes=config['notes'],
+                knowledge_context=knowledge_context,
             ),
             on_success=on_success,
             on_error=on_error,
@@ -719,6 +724,17 @@ class PolishPage(WorkspaceStateMixin):
             status_text='学术润色执行中...',
             status_color=COLORS['warning'],
         )
+
+    def _choose_knowledge_context(self, scene_id, action_label=''):
+        if not self.app_bridge or not hasattr(self.app_bridge, 'choose_knowledge_context'):
+            return {}
+        try:
+            return self.app_bridge.choose_knowledge_context(
+                scene_id, page_id=self.PAGE_STATE_ID, action_label=action_label,
+            )
+        except Exception as exc:
+            messagebox.showerror('知识库', str(exc), parent=self.frame)
+            return None
 
     def _open_prompt_manager(self):
         if not self.app_bridge:
@@ -879,6 +895,10 @@ class PolishPage(WorkspaceStateMixin):
             target_lang = lang_var.get()
             win.destroy()
 
+            knowledge_context = self._choose_knowledge_context('polish.translate', '翻译润色')
+            if knowledge_context is None:
+                return
+
             def on_success(result):
                 self.last_task_config = dict(self._collect_task_config())
                 summary = f'翻译润色完成 | 目标语言：{target_lang}'
@@ -906,7 +926,7 @@ class PolishPage(WorkspaceStateMixin):
                 self.set_status(f'翻译失败: {exc}', COLORS['error'])
 
             self.task_runner.run(
-                work=lambda: self.polisher.translate_polish(text, target_lang),
+                work=lambda: self.polisher.translate_polish(text, target_lang, knowledge_context=knowledge_context),
                 on_success=on_success,
                 on_error=on_error,
                 loading_text='正在执行翻译润色...',

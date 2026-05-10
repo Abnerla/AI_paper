@@ -17,6 +17,35 @@ from modules.prompt_center import SCENE_DEFS
 PAPER_WRITE_SCENE_IDS = tuple(
     scene_id for scene_id in SCENE_DEFS.keys() if str(scene_id).startswith('paper_write.')
 )
+ALL_KB_SCENE_IDS = tuple(SCENE_DEFS.keys())
+
+
+def append_knowledge_context(prompt, knowledge_context=None):
+    """将知识库上下文注入到提示词末尾。
+
+    Args:
+        prompt: 已渲染的用户提示词
+        knowledge_context: build_context() 返回的字典，可为 None
+
+    Returns:
+        追加了知识库资料和使用约束的提示词
+    """
+    if not isinstance(knowledge_context, dict):
+        return prompt
+    context_text = str(knowledge_context.get('context_text', '') or '').strip()
+    if not context_text:
+        return prompt
+    project_name = str(knowledge_context.get('project_name', '') or '').strip()
+    header = '【知识库资料】'
+    if project_name:
+        header = f'{header}\n项目：{project_name}'
+    constraints = (
+        '【使用约束】\n'
+        '1. 仅在资料与当前任务直接相关时使用知识库内容。\n'
+        '2. 不得编造知识库资料中不存在的来源、数据或结论。\n'
+        '3. 若资料不足以支持某个判断，应按常规要求处理，不要声称资料已经提供依据。'
+    )
+    return f'{prompt}\n\n{header}\n{context_text}\n\n{constraints}'.strip()
 DEFAULT_TOTAL_CHAR_LIMIT = 12000
 DEFAULT_PER_DOCUMENT_CHAR_LIMIT = 4000
 
@@ -114,13 +143,25 @@ class KnowledgeBaseStore:
                 continue
             seen_projects.add(project_id)
             now = _now_ts()
+            raw_bound_scene_ids = item.get('bound_scene_ids', None)
+            if raw_bound_scene_ids is None:
+                bound_scene_ids = list(ALL_KB_SCENE_IDS)
+            else:
+                bound_scene_ids = _unique_text_list(raw_bound_scene_ids, allowed=SCENE_DEFS.keys())
             projects.append({
                 'id': project_id,
                 'name': str(item.get('name', '') or '').strip() or project_id,
                 'description': str(item.get('description', '') or '').strip(),
+                'active': bool(item.get('active', False)),
+                'bound_scene_ids': bound_scene_ids,
                 'created_at': int(item.get('created_at', now) or now),
                 'updated_at': int(item.get('updated_at', now) or now),
             })
+
+        active_projects = [p for p in projects if p['active']]
+        if len(active_projects) > 1:
+            for project in projects:
+                project['active'] = False
 
         project_ids = {item['id'] for item in projects}
         documents = []
@@ -136,7 +177,7 @@ class KnowledgeBaseStore:
             now = _now_ts()
             raw_bound_scene_ids = item.get('bound_scene_ids', None)
             if raw_bound_scene_ids is None:
-                bound_scene_ids = list(PAPER_WRITE_SCENE_IDS)
+                bound_scene_ids = list(ALL_KB_SCENE_IDS)
             else:
                 bound_scene_ids = _unique_text_list(raw_bound_scene_ids, allowed=SCENE_DEFS.keys())
             documents.append({
@@ -181,6 +222,8 @@ class KnowledgeBaseStore:
             'id': _new_id('proj'),
             'name': name,
             'description': str(description or '').strip(),
+            'active': False,
+            'bound_scene_ids': list(ALL_KB_SCENE_IDS),
             'created_at': now,
             'updated_at': now,
         }
@@ -188,7 +231,7 @@ class KnowledgeBaseStore:
         self._save_index(payload)
         return dict(project)
 
-    def update_project(self, project_id, *, name=None, description=None):
+    def update_project(self, project_id, *, name=None, description=None, bound_scene_ids=None, active=None):
         payload = self._load_index()
         for project in payload['projects']:
             if project['id'] != project_id:
@@ -200,10 +243,34 @@ class KnowledgeBaseStore:
                 project['name'] = normalized_name
             if description is not None:
                 project['description'] = str(description or '').strip()
+            if bound_scene_ids is not None:
+                project['bound_scene_ids'] = _unique_text_list(bound_scene_ids, allowed=SCENE_DEFS.keys())
+            if active is not None:
+                project['active'] = bool(active)
             project['updated_at'] = _now_ts()
             self._save_index(payload)
             return dict(project)
         raise KnowledgeBaseError('知识库项目不存在')
+
+    def get_active_project(self):
+        for project in self._load_index()['projects']:
+            if project.get('active'):
+                return dict(project)
+        return None
+
+    def set_active_project(self, project_id):
+        project_id = str(project_id or '').strip()
+        payload = self._load_index()
+        found = False
+        for project in payload['projects']:
+            if project['id'] == project_id:
+                project['active'] = True
+                found = True
+            else:
+                project['active'] = False
+        if not found:
+            raise KnowledgeBaseError('知识库项目不存在')
+        self._save_index(payload)
 
     def delete_project(self, project_id):
         payload = self._load_index()
@@ -267,7 +334,7 @@ class KnowledgeBaseStore:
         text_abs_path = os.path.join(self.root_dir, text_rel_path)
         self._write_text_file(text_abs_path, text)
         if bound_scene_ids is None:
-            normalized_scene_ids = list(PAPER_WRITE_SCENE_IDS)
+            normalized_scene_ids = list(ALL_KB_SCENE_IDS)
         else:
             normalized_scene_ids = _unique_text_list(bound_scene_ids, allowed=SCENE_DEFS.keys())
         document = {

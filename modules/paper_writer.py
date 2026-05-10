@@ -5,6 +5,7 @@
 
 import json
 
+from modules.knowledge_base import append_knowledge_context
 from modules.prompt_center import PromptCenter
 
 
@@ -29,22 +30,7 @@ class PaperWriter:
 
     @staticmethod
     def _append_knowledge_context(prompt, knowledge_context=None):
-        if not isinstance(knowledge_context, dict):
-            return prompt
-        context_text = str(knowledge_context.get('context_text', '') or '').strip()
-        if not context_text:
-            return prompt
-        project_name = str(knowledge_context.get('project_name', '') or '').strip()
-        header = '【知识库资料】'
-        if project_name:
-            header = f'{header}\n项目：{project_name}'
-        constraints = (
-            '【使用约束】\n'
-            '1. 仅在资料与当前任务直接相关时使用知识库内容。\n'
-            '2. 不得编造知识库资料中不存在的来源、数据或结论。\n'
-            '3. 若资料不足以支持某个判断，应按常规论文写作要求处理，不要声称资料已经提供依据。'
-        )
-        return f'{prompt}\n\n{header}\n{context_text}\n\n{constraints}'.strip()
+        return append_knowledge_context(prompt, knowledge_context)
 
     def generate_outline(self, topic, style='学术论文', reference_style='GB/T 7714', subject='', knowledge_context=None):
         """生成论文大纲。"""

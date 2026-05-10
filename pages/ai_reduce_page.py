@@ -453,25 +453,27 @@ class AIReducePage(TextTransformPageBase):
         return '\n'.join(lines), status_text, color
 
     def _transform_text(self, text, mode):
+        kc = getattr(self, '_pending_knowledge_context', None)
         return self._rewrite_until_score_improves(
             text,
             mode,
-            rewrite_runner=lambda selected_mode: self._rewrite_text_by_mode(text, selected_mode),
+            rewrite_runner=lambda selected_mode: self._rewrite_text_by_mode(text, selected_mode, kc),
         )
 
     def _transform_with_annotations(self, text, mode, annotations):
+        kc = getattr(self, '_pending_knowledge_context', None)
         return self._rewrite_until_score_improves(
             text,
             mode,
-            rewrite_runner=lambda selected_mode: self.processor.rewrite_with_annotations(text, annotations, selected_mode),
+            rewrite_runner=lambda selected_mode: self.processor.rewrite_with_annotations(text, annotations, selected_mode, knowledge_context=kc),
         )
 
-    def _rewrite_text_by_mode(self, text, mode):
+    def _rewrite_text_by_mode(self, text, mode, knowledge_context=None):
         if mode == 'light':
-            return self.processor.rewrite_light(text)
+            return self.processor.rewrite_light(text, knowledge_context=knowledge_context)
         if mode == 'deep':
-            return self.processor.rewrite_deep(text)
-        return self.processor.rewrite_academic(text)
+            return self.processor.rewrite_deep(text, knowledge_context=knowledge_context)
+        return self.processor.rewrite_academic(text, knowledge_context=knowledge_context)
 
     @staticmethod
     def _next_stronger_mode(mode):

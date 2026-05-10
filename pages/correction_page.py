@@ -936,6 +936,10 @@ class CorrectionPage(WorkspaceStateMixin):
         if not self._ensure_prompt_ready():
             return
 
+        knowledge_context = self._choose_knowledge_context('correction.ai_review', '智能纠错')
+        if knowledge_context is None:
+            return
+
         citation_style = self.citation_style_var.get()
 
         def on_start():
@@ -976,6 +980,7 @@ class CorrectionPage(WorkspaceStateMixin):
                 text,
                 citation_style=citation_style,
                 source_kind=self.current_source_kind,
+                knowledge_context=knowledge_context,
             )
 
         self.task_runner.run(
@@ -987,6 +992,17 @@ class CorrectionPage(WorkspaceStateMixin):
             status_text='智能纠错执行中...',
             status_color=COLORS['warning'],
         )
+
+    def _choose_knowledge_context(self, scene_id, action_label=''):
+        if not self.app_bridge or not hasattr(self.app_bridge, 'choose_knowledge_context'):
+            return {}
+        try:
+            return self.app_bridge.choose_knowledge_context(
+                scene_id, page_id=self.PAGE_STATE_ID, action_label=action_label,
+            )
+        except Exception as exc:
+            messagebox.showerror('知识库', str(exc), parent=self.frame)
+            return None
 
     def _add_history_version(self, operation, input_text, output_text, extra=None):
         self.history.add(

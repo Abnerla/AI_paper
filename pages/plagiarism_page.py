@@ -459,15 +459,17 @@ class PlagiarismPage(TextTransformPageBase):
 
     def _transform_text(self, text, mode):
         source_text = self._get_compare_text()
+        kc = getattr(self, '_pending_knowledge_context', None)
         return self._reduce_until_rate_improves(
             text,
             mode,
             source_text,
-            reduce_runner=lambda selected_mode: self._reduce_text_by_mode(text, source_text, selected_mode),
+            reduce_runner=lambda selected_mode: self._reduce_text_by_mode(text, source_text, selected_mode, kc),
         )
 
     def _transform_with_annotations(self, text, mode, annotations):
         source_text = self._get_compare_text()
+        kc = getattr(self, '_pending_knowledge_context', None)
         return self._reduce_until_rate_improves(
             text,
             mode,
@@ -477,15 +479,16 @@ class PlagiarismPage(TextTransformPageBase):
                 annotations,
                 selected_mode,
                 source_text=source_text,
+                knowledge_context=kc,
             ),
         )
 
-    def _reduce_text_by_mode(self, text, source_text, mode):
+    def _reduce_text_by_mode(self, text, source_text, mode, knowledge_context=None):
         if mode == 'light':
-            return self.processor.reduce_light(text, source_text)
+            return self.processor.reduce_light(text, source_text, knowledge_context=knowledge_context)
         if mode == 'medium':
-            return self.processor.reduce_medium(text, source_text)
-        return self.processor.reduce_deep(text, source_text)
+            return self.processor.reduce_medium(text, source_text, knowledge_context=knowledge_context)
+        return self.processor.reduce_deep(text, source_text, knowledge_context=knowledge_context)
 
     @staticmethod
     def _next_stronger_mode(mode):

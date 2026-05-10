@@ -3543,7 +3543,13 @@ class HomePage:
             return
         callback = getattr(self.app_bridge, action_name, None)
         if callable(callback):
-            callback()
+            try:
+                callback()
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                from tkinter import messagebox
+                messagebox.showerror('操作失败', f'{action_name} 执行出错：\n{exc}', parent=self.frame)
 
     def _navigate(self, page_id):
         if callable(self.navigate_page) and page_id:
