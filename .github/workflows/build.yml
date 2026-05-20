@@ -6,22 +6,16 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      create_release:
-        description: '是否创建 Release'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
       build_version:
         description: '手动构建时使用的版本号'
-        required: false
-        default: ''
+        required: true
         type: string
 
 permissions:
   contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build:
@@ -29,7 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2025
             platform: windows
             artifact_name: AI_Paper-Windows
             artifact_ext: .exe
@@ -171,7 +165,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
     name: 发布 Release
     env:
       RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.event.inputs.build_version }}

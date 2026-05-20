@@ -38,6 +38,11 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from modules.runtime_paths import get_runtime_paths, refresh_runtime_paths
+from modules.updater import (
+    can_auto_update, build_asset_url, download_with_progress,
+    verify_sha256, apply_update, detect_install_mode,
+    UpdateCancelled, UnsupportedArchError, UpdateNetworkError, UpdateDiskError,
+)
 
 try:
     import winreg
@@ -429,6 +434,8 @@ class SmartPaperTool:
         self._version_check_anim_job = None
         self._version_check_button = None
         self._version_check_busy = False
+        self._update_in_progress = False
+        self._last_progress_ts = 0
         self._pending_version_update_data = None
         self.bell_button = None
         self.bell_badge = None
@@ -1624,6 +1631,26 @@ class SmartPaperTool:
                     ).pack(anchor='w', fill=tk.X)
 
             download_url = data.get('download_url', '')
+            sha256_data = data.get('sha256', {})
+
+            # 更新进度面板（初始隐藏）
+            update_panel = tk.Frame(content, bg=COLORS['card_bg'])
+            update_status_label = tk.Label(
+                update_panel, text='', font=FONTS['body'],
+                fg=COLORS['text_main'], bg=COLORS['card_bg'], anchor='w',
+            )
+            update_status_label.pack(anchor='w', fill=tk.X, pady=(8, 4))
+            update_progress = ttk.Progressbar(
+                update_panel, style='Primary.Horizontal.TProgressbar',
+                mode='determinate', maximum=100, length=520,
+            )
+            update_progress.pack(fill=tk.X, pady=(0, 4))
+            update_detail_label = tk.Label(
+                update_panel, text='', font=FONTS['body'],
+                fg=COLORS['text_sub'], bg=COLORS['card_bg'], anchor='w',
+            )
+            update_detail_label.pack(anchor='w', fill=tk.X)
+
             def ignore_current_version():
                 if not self._remember_ignored_update(latest):
                     messagebox.showerror('保存失败', '无法保存忽略提醒设置。', parent=window)
@@ -1631,24 +1658,40 @@ class SmartPaperTool:
                 self._set_status(f'已忽略版本 {latest} 的启动提醒', COLORS['success'])
                 self._close_dialog(window)
 
-            def open_update_page():
-                if download_url:
-                    webbrowser.open(download_url)
-                self._close_dialog(window)
+            ui_refs = {
+                'window': window,
+                'panel': update_panel,
+                'status': update_status_label,
+                'progress': update_progress,
+                'detail': update_detail_label,
+                'download_url': download_url,
+                'sha256_data': sha256_data,
+                'latest': latest,
+                'requires_forced': requires_forced_update,
+            }
 
-            ModernButton(
-                footer,
-                '更新',
-                style='primary',
-                command=open_update_page,
-            ).pack(side=tk.RIGHT)
+            update_btn = ModernButton(footer, '更新', style='primary', command=lambda: None)
+            update_btn.pack(side=tk.RIGHT)
+            ui_refs['update_btn'] = update_btn
+            ignore_btn = None
             if not requires_forced_update:
-                ModernButton(
-                    footer,
-                    '本次更新不再提示',
-                    style='secondary',
+                ignore_btn = ModernButton(
+                    footer, '本次更新不再提示', style='secondary',
                     command=ignore_current_version,
-                ).pack(side=tk.RIGHT, padx=(0, 10))
+                )
+                ignore_btn.pack(side=tk.RIGHT, padx=(0, 10))
+            ui_refs['ignore_btn'] = ignore_btn
+
+            def start_update():
+                ok, reason = can_auto_update()
+                if not ok:
+                    if messagebox.askyesno('无法自动更新', f'{reason}\n\n是否打开下载页？', parent=window):
+                        if download_url:
+                            webbrowser.open(download_url)
+                    return
+                self._start_inline_update(ui_refs)
+
+            update_btn.configure(command=start_update)
         else:
             tk.Label(
                 content,
@@ -1660,6 +1703,173 @@ class SmartPaperTool:
                 justify='center',
             ).pack(fill=tk.X)
             ModernButton(footer, '关闭', style='secondary', command=lambda: self._close_dialog(window)).pack(side=tk.RIGHT)
+
+    def _start_inline_update(self, ui_refs):
+        window = ui_refs['window']
+        update_btn = ui_refs['update_btn']
+        ignore_btn = ui_refs['ignore_btn']
+        panel = ui_refs['panel']
+
+        # 显示进度面板
+        panel.pack(fill=tk.X, pady=(10, 0))
+        ui_refs['status']['text'] = '正在准备下载...'
+        ui_refs['detail']['text'] = ''
+        ui_refs['progress']['value'] = 0
+
+        # 禁用按钮
+        update_btn.configure(text='下载中...', state=tk.DISABLED)
+        if ignore_btn:
+            ignore_btn.configure(state=tk.DISABLED)
+
+        # 禁用窗口关闭
+        self._update_in_progress = True
+        if ui_refs['requires_forced']:
+            window.protocol('WM_DELETE_WINDOW', lambda: None)
+        else:
+            cancel_event = threading.Event()
+            ui_refs['cancel_event'] = cancel_event
+            window.protocol('WM_DELETE_WINDOW', lambda: self._cancel_inline_update(ui_refs))
+
+        # 进度节流
+        self._last_progress_ts = 0
+
+        # 启动下载线程
+        cancel_event = ui_refs.get('cancel_event') or threading.Event()
+        ui_refs['cancel_event'] = cancel_event
+        t = threading.Thread(
+            target=self._run_update_worker,
+            args=(ui_refs, cancel_event),
+            daemon=True,
+        )
+        t.start()
+        ui_refs['thread'] = t
+
+    def _cancel_inline_update(self, ui_refs):
+        cancel_event = ui_refs.get('cancel_event')
+        if cancel_event:
+            cancel_event.set()
+
+    def _run_update_worker(self, ui_refs, cancel_event):
+        latest = ui_refs['latest']
+        sha256_data = ui_refs['sha256_data']
+        download_url = ui_refs['download_url']
+
+        try:
+            mode = detect_install_mode()
+            url = build_asset_url(latest, mode)
+            self._write_app_log(f'开始下载更新: {url}')
+
+            dest_dir = os.path.join(get_runtime_paths().temp_dir, 'update')
+            os.makedirs(dest_dir, exist_ok=True)
+            filename = url.rsplit('/', 1)[-1]
+            dest = os.path.join(dest_dir, filename)
+
+            def on_progress(done, total, speed):
+                now = time.time()
+                if now - self._last_progress_ts < 0.2:
+                    return
+                self._last_progress_ts = now
+                self.root.after(0, self._on_update_progress, done, total, speed, ui_refs)
+
+            from pathlib import Path
+            asset = download_with_progress(url, dest, on_progress, cancel_event)
+            self._write_app_log(f'下载完成: {asset}')
+
+            # SHA256 校验（可选）
+            sha_key_map = {
+                'installer': 'windows-setup',
+                'portable': 'windows',
+                'dmg': 'macos-apple-silicon' if __import__('platform').machine() == 'arm64' else 'macos-intel',
+                'appimage': 'linux-appimage',
+            }
+            expected_sha = sha256_data.get(sha_key_map.get(mode, ''))
+            if expected_sha and not verify_sha256(asset, expected_sha):
+                self.root.after(0, self._on_update_failed, '文件校验失败，安装包可能已损坏', download_url, ui_refs)
+                return
+
+            self.root.after(0, self._on_update_ready, asset, mode, ui_refs)
+
+        except UpdateCancelled:
+            self.root.after(0, self._on_update_cancelled, ui_refs)
+        except (UpdateNetworkError, UpdateDiskError, UnsupportedArchError, OSError) as exc:
+            self._write_app_log(f'更新失败: {exc}')
+            self.root.after(0, self._on_update_failed, str(exc), download_url, ui_refs)
+
+    def _on_update_progress(self, done, total, speed, ui_refs):
+        try:
+            if total > 0:
+                ui_refs['progress']['value'] = done / total * 100
+            ui_refs['status']['text'] = '正在下载新版本...'
+            if total > 0:
+                ui_refs['detail']['text'] = f'{done / 1048576:.1f} / {total / 1048576:.1f} MB · {speed / 1024:.0f} KB/s'
+            else:
+                ui_refs['detail']['text'] = f'{done / 1048576:.1f} MB · {speed / 1024:.0f} KB/s'
+        except tk.TclError:
+            pass
+
+    def _on_update_ready(self, asset, mode, ui_refs):
+        self._update_in_progress = False
+        try:
+            ui_refs['progress']['value'] = 100
+            ui_refs['status']['text'] = '下载完成，点击下方按钮立即重启完成更新'
+            ui_refs['detail']['text'] = ''
+
+            update_btn = ui_refs['update_btn']
+            update_btn.configure(
+                text='立即重启更新',
+                state=tk.NORMAL,
+                command=lambda: apply_update(asset, mode),
+            )
+            if hasattr(update_btn, 'set_style'):
+                update_btn.set_style('primary')
+
+            window = ui_refs['window']
+            window.protocol('WM_DELETE_WINDOW', lambda: self._close_dialog(window))
+        except tk.TclError:
+            pass
+
+    def _on_update_cancelled(self, ui_refs):
+        self._update_in_progress = False
+        try:
+            ui_refs['status']['text'] = '下载已取消'
+            ui_refs['detail']['text'] = ''
+            ui_refs['progress']['value'] = 0
+
+            update_btn = ui_refs['update_btn']
+            update_btn.configure(text='重试', state=tk.NORMAL, command=lambda: self._start_inline_update(ui_refs))
+
+            ignore_btn = ui_refs['ignore_btn']
+            if ignore_btn:
+                ignore_btn.configure(state=tk.NORMAL)
+
+            window = ui_refs['window']
+            window.protocol('WM_DELETE_WINDOW', lambda: self._close_dialog(window))
+        except tk.TclError:
+            pass
+
+    def _on_update_failed(self, msg, download_url, ui_refs):
+        self._update_in_progress = False
+        try:
+            ui_refs['status']['text'] = f'更新失败: {msg}'
+            ui_refs['detail']['text'] = ''
+            ui_refs['progress']['value'] = 0
+
+            update_btn = ui_refs['update_btn']
+            update_btn.configure(text='重试', state=tk.NORMAL, command=lambda: self._start_inline_update(ui_refs))
+
+            ignore_btn = ui_refs['ignore_btn']
+            if ignore_btn:
+                ignore_btn.configure(state=tk.NORMAL)
+                # 替换为"打开下载页"
+                ignore_btn.configure(
+                    text='打开下载页',
+                    command=lambda: webbrowser.open(download_url) if download_url else None,
+                )
+
+            window = ui_refs['window']
+            window.protocol('WM_DELETE_WINDOW', lambda: self._close_dialog(window))
+        except tk.TclError:
+            pass
 
     def _check_version_update(self, button=None, *, silent=False):
         if self._version_check_busy:
